@@ -1,10 +1,10 @@
 import os
-import html as html_lib
 import time
 import threading
 import re
 import csv
 import xml.etree.ElementTree as ET
+import html as html_lib
 from urllib.parse import quote_plus
 from datetime import datetime, timezone
 
@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Gold AI Live v7")
+app = FastAPI(title="Gold AI Live v8")
 
 PRICE_API_KEY = os.getenv("PRICE_API_KEY", "").strip()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
@@ -538,21 +538,247 @@ def news():
     return get_news()
 
 
+
 HTML_PAGE = r"""
-<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gold AI Live v7</title>
-<style>body{margin:0;background:#09101d;color:#f4f6f8;font-family:Arial,sans-serif}.wrap{max-width:1200px;margin:auto;padding:14px}h1{font-size:25px;margin:0 0 5px}.sub,.small{color:#9eabc0;font-size:13px}.tabs{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin:14px 0}button{background:#1a2740;color:#fff;border:0;border-radius:9px;padding:11px 3px;font-weight:700}button.active{background:#2677ff}.card{background:#101a2c;border:1px solid #263653;border-radius:15px;padding:15px;margin-bottom:12px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.price{font-size:34px;font-weight:900;margin-top:7px}.call{font-size:32px;font-weight:900;margin:8px 0}.buy{color:#43e28c}.sell{color:#ff6c79}.wait{color:#ffd36c}.row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #24314a}.news a{color:#8fbaff;text-decoration:none}@media(max-width:700px){.tabs{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:1fr}.price{font-size:30px}}</style></head><body><div class="wrap">
-<h1>🥇 Gold AI Live v7</h1><div class="sub">XAU/USD • XM360-focused candles • Technical + Multi-Timeframe + Global News</div>
-<div class="tabs"><button data-t="1m">1m</button><button data-t="5m">5m</button><button data-t="15m">15m</button><button data-t="30m">30m</button><button data-t="1h">1H</button><button data-t="4h">4H</button><button data-t="1d">1D</button></div>
-<div class="card"><div>XAU/USD <span id="status">LIVE</span></div><div id="price" class="price">Loading...</div><div id="source" class="small">Market data...</div></div>
-<div class="grid"><div class="card"><div class="small">AI MARKET CALL</div><div id="call" class="call wait">WAIT</div><div class="row"><span>BUY possibility</span><b id="buy">-</b></div><div class="row"><span>SELL possibility</span><b id="sell">-</b></div><div class="row"><span>Model confidence</span><b id="conf">-</b></div><div class="row"><span>Global news bias</span><b id="nbias">-</b></div><div class="row"><span>News articles</span><b id="ncount">-</b></div><div class="small" id="reason">Waiting...</div></div>
-<div class="card"><div class="small">XM360 / MARKET CANDLE ANALYSIS</div><div class="row"><span>Candle source</span><b id="csource">-</b></div><div class="row"><span>EMA20</span><b id="e20">-</b></div><div class="row"><span>EMA50</span><b id="e50">-</b></div><div class="row"><span>EMA200</span><b id="e200">-</b></div><div class="row"><span>RSI</span><b id="rsi">-</b></div><div class="row"><span>MACD</span><b id="macd">-</b></div><div class="row"><span>ATR</span><b id="atr">-</b></div></div></div>
-<div class="card"><div class="small">STOP LOSS / TAKE PROFIT / PROFIT LOCK</div><div class="row"><span>Entry</span><b id="entry">-</b></div><div class="row"><span>Stop Loss</span><b id="sl">-</b></div><div class="row"><span>TP1</span><b id="tp1">-</b></div><div class="row"><span>TP2</span><b id="tp2">-</b></div><div class="row"><span>TP3</span><b id="tp3">-</b></div><div class="row"><span>Profit Lock</span><b id="plock">-</b></div><div class="small">Analytical levels only. The app does not place broker orders.</div></div>
-<div class="card"><div class="small">GLOBAL GOLD NEWS</div><div id="news">Loading...</div></div></div>
-<script>let tf="1h";const $=id=>document.getElementById(id);function put(id,v){$(id).textContent=v===null||v===undefined?"-":v}document.querySelectorAll("[data-t]").forEach(b=>b.onclick=()=>{tf=b.dataset.t;document.querySelectorAll("[data-t]").forEach(x=>x.classList.toggle("active",x===b));loadSignal()});document.querySelector('[data-t="1h"]').classList.add("active");
-async function loadPrice(){try{let d=await(await fetch("/api/live-price?x="+Date.now())).json();put("price",d.price!=null?Number(d.price).toFixed(2):"Waiting");put("source","Source: "+(d.source||"-"));put("status",d.status==="backup"?"BACKUP":"LIVE")}catch(e){put("price","Error")}}
-async function loadSignal(){try{let d=await(await fetch("/api/live-signal?timeframe="+encodeURIComponent(tf)+"&x="+Date.now())).json();let c=$("call");c.textContent=d.call||"WAIT";c.className="call "+(d.call==="BUY"?"buy":d.call==="SELL"?"sell":"wait");put("buy",(d.buy_probability??"-")+"%");put("sell",(d.sell_probability??"-")+"%");put("conf",(d.confidence??"-")+"%");put("nbias",d.news?.bias||"-");put("ncount",d.news?.article_count??"-");put("reason",d.reason||"-");put("csource",d.data_source||"-");let t=d.technical||{};put("e20",t.EMA20);put("e50",t.EMA50);put("e200",t.EMA200);put("rsi",t.RSI);put("macd",t.MACD);put("atr",t.ATR);let r=d.risk||{};put("entry",r.entry);put("sl",r.stop_loss);put("tp1",r.tp1);put("tp2",r.tp2);put("tp3",r.tp3);put("plock",r.profit_lock)}catch(e){put("reason","Signal temporarily unavailable")}}
-async function loadNews(){try{let d=await(await fetch("/api/news?x="+Date.now())).json();if(!d.articles?.length){$("news").textContent=d.message||"News unavailable";return}$("news").innerHTML=d.articles.map(a=>`<div style="padding:8px 0;border-bottom:1px solid #24314a"><a target="_blank" rel="noopener" href="${a.url||"#"}">${a.title||"Gold news"}</a><div class="small">${a.source||""} • impact ${a.impact||"-"} • ${a.direction>0?"bullish":a.direction<0?"bearish":"neutral"}</div></div>`).join("")}catch(e){$("news").textContent="News unavailable"}}
-function loadAll(){loadPrice();loadSignal();loadNews()}loadAll();setInterval(loadPrice,15000);setInterval(loadSignal,60000);setInterval(loadNews,600000);</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Gold AI Live v8</title>
+<style>
+:root{
+  --bg:#07101d;--card:#0d192b;--card2:#102039;--line:#243754;
+  --text:#f5f7fb;--muted:#91a0b8;--blue:#2678ff;
+  --green:#20d59a;--red:#ff5d70;--gold:#f3bd3f;--yellow:#ffd66b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at 50% -10%,#122743 0,#07101d 42%,#050b14 100%);
+color:var(--text);font-family:Inter,Arial,sans-serif}
+.wrap{max-width:1180px;margin:auto;padding:18px 18px 34px}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px}
+.brand{display:flex;gap:12px;align-items:center}.logo{font-size:35px}
+h1{font-size:27px;margin:0 0 4px;letter-spacing:-.5px}
+.sub{color:#aab6c9;font-size:14px;line-height:1.35}
+.livebox{text-align:right}.live{display:inline-flex;align-items:center;gap:7px;color:#00e69a;font-weight:800}
+.dot{width:10px;height:10px;background:#00e69a;border-radius:50%;display:inline-block;box-shadow:0 0 12px #00e69a}
+.clock{color:#91a0b8;font-size:12px;margin-top:4px}
+.tabs{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin:16px 0}
+button{background:#14243d;color:#eef3fb;border:1px solid #1c3150;border-radius:13px;padding:13px 5px;font-size:15px;font-weight:800}
+button.active{background:var(--blue);border-color:#4d94ff;box-shadow:0 8px 25px #2678ff33}
+.card{background:linear-gradient(145deg,#0e1b2f,#0a1525);border:1px solid var(--line);border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 35px #00000022}
+.pricecard{padding:20px}
+.pricegrid{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:18px;align-items:center}
+.instrument{color:#dfe7f4;font-size:15px;font-weight:800}.instrument span{color:#6f819e;font-weight:600;margin-left:8px}
+.price{font-size:48px;font-weight:950;letter-spacing:-1px;margin:5px 0}
+.change{font-weight:800}.down{color:var(--red)}.up{color:var(--green)}
+.quote{border-radius:15px;padding:15px 16px;text-align:center;border:1px solid}
+.quote.sell{border-color:#ff5268;background:#341725}.quote.buy{border-color:#00c996;background:#092f2a}
+.qtitle{font-weight:800;font-size:15px}.qprice{font-size:28px;font-weight:950;margin-top:4px}
+.spreadrow{display:flex;justify-content:space-around;color:var(--muted);font-size:12px;margin-top:10px}
+.spreadrow b{display:block;color:#e8edf5;font-size:14px;margin-top:3px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.section-title{font-size:13px;color:#a9b5c8;font-weight:800;letter-spacing:.2px}
+.call{font-size:42px;font-weight:950;margin:10px 0}.call.buy{color:var(--green)}.call.sell{color:var(--red)}.call.wait{color:var(--yellow)}
+.badge{float:right;border-radius:14px;padding:6px 10px;font-size:12px;font-weight:900}
+.badge.bear{background:#4a1d28;color:#ff8291}.badge.bull{background:#103b31;color:#48e6b0}.badge.mix{background:#3d3217;color:#ffd66b}
+.row{display:flex;justify-content:space-between;gap:15px;padding:10px 0;border-bottom:1px solid #203149}
+.row:last-child{border-bottom:0}.row span{color:#dfe6f0}.row b{color:#f7f9fc}
+.source{margin-top:10px;color:#8493aa;font-size:12px}
+.source strong{color:#00d99b}
+.notice{border:1px solid #1d785f;background:#06261f;border-radius:16px;padding:13px 15px;color:#aeeedd;margin-top:12px}
+.notice.warn{border-color:#775f24;background:#2b220b;color:#ffe5a0}
+.news a{color:#a9c8ff;text-decoration:none;font-weight:700}.newsitem{padding:11px 0;border-bottom:1px solid #203149}.newsitem:last-child{border-bottom:0}
+.small{font-size:12px;color:var(--muted);line-height:1.4}
+.refresh{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px;margin:4px 2px 12px}
+.refresh strong{color:#00df9c}
+@media(max-width:760px){
+ .wrap{padding:12px 12px 28px}.top{align-items:flex-start}.livebox{display:none}
+ h1{font-size:24px}.sub{font-size:13px}.tabs{grid-template-columns:repeat(4,1fr);gap:7px}
+ .pricegrid{grid-template-columns:1fr 1fr;gap:10px}.mainprice{grid-column:1/-1}
+ .price{font-size:40px}.qprice{font-size:23px}.grid{grid-template-columns:1fr}
+ .card{border-radius:17px;padding:15px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand">
+      <div class="logo">🥇</div>
+      <div>
+        <h1>Gold AI Live v8 <span class="live"><span class="dot"></span>Live</span></h1>
+        <div class="sub">XAU/USD • XM360-focused • Technical + Multi-Timeframe + Global News</div>
+      </div>
+    </div>
+    <div class="livebox">
+      <div class="live"><span class="dot"></span>Live Market</div>
+      <div id="clock" class="clock">--:--:-- IST</div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button data-t="1m">1m</button><button data-t="5m">5m</button>
+    <button data-t="15m">15m</button><button data-t="30m">30m</button>
+    <button data-t="1h">1H</button><button data-t="4h">4H</button><button data-t="1d">1D</button>
+  </div>
+
+  <div class="card pricecard">
+    <div class="pricegrid">
+      <div class="mainprice">
+        <div class="instrument">XAU/USD (GOLD) <span id="mode">Market</span></div>
+        <div id="price" class="price">Loading...</div>
+        <div id="change" class="change">Live quote</div>
+      </div>
+      <div class="quote sell"><div class="qtitle">SELL</div><div id="sellq" class="qprice">-</div></div>
+      <div class="quote buy"><div class="qtitle">BUY</div><div id="buyq" class="qprice">-</div></div>
+    </div>
+    <div class="spreadrow">
+      <div>Spread<b id="spread">-</b></div>
+      <div>Source<b id="source">-</b></div>
+      <div>Updated<b id="updated">-</b></div>
+    </div>
+  </div>
+
+  <div class="refresh">
+    <span>Data status: <strong id="status">Connecting...</strong></span>
+    <span>Auto refresh: <strong>ON</strong></span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="section-title">AI MARKET CALL <span id="biasbadge" class="badge mix">WAIT</span></div>
+      <div id="call" class="call wait">WAIT</div>
+      <div class="row"><span>BUY possibility</span><b id="buy">-</b></div>
+      <div class="row"><span>SELL possibility</span><b id="sell">-</b></div>
+      <div class="row"><span>Model confidence</span><b id="conf">-</b></div>
+      <div class="row"><span>Global news bias</span><b id="nbias">-</b></div>
+      <div class="row"><span>News articles</span><b id="ncount">-</b></div>
+      <div class="source" id="reason">Waiting for live analysis...</div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">MARKET CANDLE ANALYSIS <span id="candlebadge" class="badge mix">-</span></div>
+      <div class="row"><span>Candle source</span><b id="csource">-</b></div>
+      <div class="row"><span>EMA20</span><b id="e20">-</b></div>
+      <div class="row"><span>EMA50</span><b id="e50">-</b></div>
+      <div class="row"><span>EMA200</span><b id="e200">-</b></div>
+      <div class="row"><span>RSI</span><b id="rsi">-</b></div>
+      <div class="row"><span>MACD</span><b id="macd">-</b></div>
+      <div class="row"><span>ATR</span><b id="atr">-</b></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">STOP LOSS / TAKE PROFIT / PROFIT LOCK</div>
+    <div class="row"><span>Entry</span><b id="entry">-</b></div>
+    <div class="row"><span>Stop Loss</span><b id="sl">-</b></div>
+    <div class="row"><span>TP1</span><b id="tp1">-</b></div>
+    <div class="row"><span>TP2</span><b id="tp2">-</b></div>
+    <div class="row"><span>TP3</span><b id="tp3">-</b></div>
+    <div class="row"><span>Profit Lock</span><b id="plock">-</b></div>
+    <div class="small" style="margin-top:10px">Analytical levels only. No broker order is placed by this dashboard.</div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">GLOBAL GOLD NEWS</div>
+    <div id="news" class="news">Loading...</div>
+  </div>
+
+  <div id="notice" class="notice warn">
+    <b>Important:</b> XM360 exact live price is used only when an XM360 feed/CSV is actually connected.
+    The dashboard will not pretend Yahoo futures is an exact XM360 quote.
+  </div>
+</div>
+
+<script>
+let tf="1h";
+const $=id=>document.getElementById(id);
+const put=(id,v)=>$(id).textContent=(v===null||v===undefined||v==="")?"-":v;
+function setActive(){
+  document.querySelectorAll("[data-t]").forEach(b=>b.classList.toggle("active",b.dataset.t===tf));
+}
+document.querySelectorAll("[data-t]").forEach(b=>b.onclick=()=>{tf=b.dataset.t;setActive();loadSignal()});
+setActive();
+
+function fmt(v){return v==null?"-":Number(v).toFixed(2)}
+function updateClock(){
+  const d=new Date();
+  const s=d.toLocaleTimeString("en-IN",{hour12:false,timeZone:"Asia/Kolkata"});
+  $("clock").textContent=s+" IST";
+}
+setInterval(updateClock,1000); updateClock();
+
+async function loadPrice(){
+  try{
+    const d=await (await fetch("/api/live-price?x="+Date.now(),{cache:"no-store"})).json();
+    if(d.price!=null){
+      const p=Number(d.price); put("price",fmt(p));
+      // For sources that expose bid/ask, use them; otherwise show the same analytical mid.
+      const bid=d.sell ?? d.bid ?? p;
+      const ask=d.buy ?? d.ask ?? p;
+      put("sellq",fmt(bid)); put("buyq",fmt(ask));
+      put("spread",fmt(Number(ask)-Number(bid)));
+      put("source",d.source||"-"); put("updated",new Date().toLocaleTimeString("en-IN",{hour12:false}));
+      $("status").textContent=d.status==="backup"?"BACKUP DATA":"LIVE DATA";
+      $("mode").textContent=d.status==="backup"?"Backup":"Live";
+      $("notice").className=d.status==="backup"?"notice warn":"notice";
+      $("notice").innerHTML=d.status==="backup"
+        ? "<b>Backup data:</b> The current quote is not confirmed as the exact XM360 broker quote."
+        : "<b>Live data:</b> Current market feed is connected.";
+    }else{
+      $("status").textContent="WAITING FOR DATA";
+    }
+  }catch(e){$("status").textContent="CONNECTION ERROR"}
+}
+
+async function loadSignal(){
+  try{
+    const d=await (await fetch("/api/live-signal?timeframe="+encodeURIComponent(tf)+"&x="+Date.now(),{cache:"no-store"})).json();
+    const c=$("call"); c.textContent=d.call||"WAIT";
+    c.className="call "+(d.call==="BUY"?"buy":d.call==="SELL"?"sell":"wait");
+    put("buy",(d.buy_probability??"-")+"%");
+    put("sell",(d.sell_probability??"-")+"%");
+    put("conf",(d.confidence??"-")+"%");
+    put("nbias",d.news?.bias||"-");
+    put("ncount",d.news?.article_count??"-");
+    put("reason",d.reason||"-");
+    put("csource",d.data_source||"-");
+    $("candlebadge").textContent=d.data_source||"-";
+    const t=d.technical||{};
+    put("e20",fmt(t.EMA20)); put("e50",fmt(t.EMA50)); put("e200",fmt(t.EMA200));
+    put("rsi",fmt(t.RSI)); put("macd",fmt(t.MACD)); put("atr",fmt(t.ATR));
+    const r=d.risk||{};
+    put("entry",fmt(r.entry)); put("sl",fmt(r.stop_loss)); put("tp1",fmt(r.tp1));
+    put("tp2",fmt(r.tp2)); put("tp3",fmt(r.tp3)); put("plock",fmt(r.profit_lock));
+    const bias=(d.news?.bias||"MIXED").toUpperCase();
+    const bb=$("biasbadge"); bb.textContent=bias; bb.className="badge "+(bias==="BEARISH"?"bear":bias==="BULLISH"?"bull":"mix");
+  }catch(e){
+    $("call").textContent="WAIT"; $("call").className="call wait";
+    put("reason","Signal temporarily unavailable");
+  }
+}
+
+async function loadNews(){
+  try{
+    const d=await (await fetch("/api/news?x="+Date.now(),{cache:"no-store"})).json();
+    if(!d.articles?.length){$("news").textContent=d.message||"News unavailable";return}
+    $("news").innerHTML=d.articles.map(a=>{
+      const dir=a.direction>0?"bullish":a.direction<0?"bearish":"neutral";
+      return `<div class="newsitem"><a target="_blank" rel="noopener" href="${a.url||"#"}">${a.title||"Gold news"}</a>
+      <div class="small">${a.source||""} • impact ${a.impact||"-"} • ${dir}</div></div>`;
+    }).join("");
+  }catch(e){$("news").textContent="News unavailable"}
+}
+
+function loadAll(){loadPrice();loadSignal();loadNews()}
+loadAll();
+setInterval(loadPrice,15000);
+setInterval(loadSignal,60000);
+setInterval(loadNews,600000);
+</script>
+</body>
+</html>
 """
 
 
