@@ -1,6 +1,10 @@
 import os
 import time
 import threading
+import re
+import csv
+import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus
 from datetime import datetime, timezone
 
 import requests
@@ -10,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Gold AI Live v6")
+app = FastAPI(title="Gold AI Live v7")
 
 PRICE_API_KEY = os.getenv("PRICE_API_KEY", "").strip()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
@@ -20,7 +24,8 @@ YAHOO_SYMBOL = "GC=F"
 
 PRICE_CACHE_SECONDS = 15
 CANDLE_CACHE_SECONDS = 60
-NEWS_CACHE_SECONDS = 1800
+NEWS_CACHE_SECONDS = 600
+XM360_CSV_PATH = os.getenv("XM360_CSV_PATH", "xm360_gold.csv").strip()
 
 TIMEFRAME_MAP = {
     "1m": ("1m", "1d"),
@@ -208,107 +213,94 @@ def get_price():
     return data
 
 
+def read_xm360_csv():
+    if not XM360_CSV_PATH or not os.path.exists(XM360_CSV_PATH):
+        return [], "XM360_CSV_NOT_FOUND"
+    try:
+        rows = []
+        with open(XM360_CSV_PATH, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for raw in reader:
+                d = {str(k).strip().lower(): v for k, v in raw.items()}
+                def pick(*names):
+                    for n in names:
+                        if n in d and d[n] not in (None, ""):
+                            return d[n]
+                    return None
+                dt, o, h, l, c = pick("datetime","date","time","timestamp"), pick("open","o"), pick("high","h"), pick("low","l"), pick("close","c")
+                if not all(v is not None for v in (dt,o,h,l,c)):
+                    continue
+                try:
+                    ds = str(dt).replace("Z", "+00:00")
+                    if re.fullmatch(r"\d+(\.\d+)?", ds):
+                        ds = datetime.fromtimestamp(float(ds), timezone.utc).isoformat()
+                    elif "T" not in ds and " " in ds:
+                        ds = ds.replace(" ", "T")
+                    rows.append({"datetime": ds, "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(pick("volume","v") or 0)})
+                except Exception:
+                    continue
+        rows.sort(key=lambda x: x["datetime"])
+        return rows, None if rows else "XM360_CSV_EMPTY"
+    except Exception as e:
+        return [], f"XM360_CSV_{type(e).__name__}"
+
+def resample_4h(rows):
+    grouped, bucket, current = [], None, None
+    for row in rows:
+        try:
+            dt = datetime.fromisoformat(row["datetime"].replace("Z", "+00:00"))
+            key = dt.replace(hour=(dt.hour // 4) * 4, minute=0, second=0, microsecond=0).isoformat()
+        except Exception:
+            continue
+        if key != bucket:
+            if current: grouped.append(current)
+            bucket = key
+            current = dict(row); current["datetime"] = key
+        else:
+            current["high"] = max(current["high"], row["high"])
+            current["low"] = min(current["low"], row["low"])
+            current["close"] = row["close"]
+            current["volume"] += row.get("volume", 0)
+    if current: grouped.append(current)
+    return grouped
+
 def get_candles(timeframe):
     timeframe = timeframe if timeframe in TIMEFRAME_MAP else "1h"
-
     with lock:
         item = candle_cache.get(timeframe)
         if item and cache_fresh(item, CANDLE_CACHE_SECONDS):
             return item["data"]
 
+    xm_rows, xm_err = read_xm360_csv()
+    if xm_rows:
+        rows = resample_4h(xm_rows) if timeframe == "4h" else xm_rows
+        result = {"symbol": SYMBOL, "timeframe": timeframe, "candles": rows[-500:], "source": "XM360 CSV", "status": "ok", "error": None, "updated": now_iso()}
+        with lock: candle_cache[timeframe] = {"time": time.time(), "data": result}
+        return result
+
     interval, range_ = TIMEFRAME_MAP[timeframe]
-
-    # 4H is constructed from Yahoo 1H candles.
     rows, err = yahoo_candles(interval, range_)
-
     if timeframe == "4h" and rows:
-        grouped = []
-        bucket = None
-        current = None
+        rows = resample_4h(rows)
+    source = "Yahoo Finance GC=F"
 
-        for row in rows:
-            dt = datetime.fromisoformat(row["datetime"])
-            hour_bucket = dt.replace(
-                hour=(dt.hour // 4) * 4,
-                minute=0,
-                second=0,
-                microsecond=0
-            ).isoformat()
-
-            if bucket != hour_bucket:
-                if current:
-                    grouped.append(current)
-                bucket = hour_bucket
-                current = {
-                    "datetime": hour_bucket,
-                    "open": row["open"],
-                    "high": row["high"],
-                    "low": row["low"],
-                    "close": row["close"],
-                    "volume": row["volume"]
-                }
-            else:
-                current["high"] = max(current["high"], row["high"])
-                current["low"] = min(current["low"], row["low"])
-                current["close"] = row["close"]
-                current["volume"] += row["volume"]
-
-        if current:
-            grouped.append(current)
-        rows = grouped
-
-    # Primary Twelve Data fallback for candles if Yahoo failed.
     if not rows:
-        td_interval = {
-            "1m": "1min",
-            "5m": "5min",
-            "15m": "15min",
-            "30m": "30min",
-            "1h": "1h",
-            "4h": "4h",
-            "1d": "1day",
-        }[timeframe]
-
-        td, td_err = td_get(
-            "time_series",
-            {
-                "symbol": SYMBOL,
-                "interval": td_interval,
-                "outputsize": 300
-            }
-        )
-
+        td_interval = {"1m":"1min","5m":"5min","15m":"15min","30m":"30min","1h":"1h","4h":"4h","1d":"1day"}[timeframe]
+        td, td_err = td_get("time_series", {"symbol": SYMBOL, "interval": td_interval, "outputsize": 500})
         if td and td.get("values"):
             rows = []
             for v in reversed(td["values"]):
                 try:
-                    rows.append({
-                        "datetime": v.get("datetime"),
-                        "open": float(v["open"]),
-                        "high": float(v["high"]),
-                        "low": float(v["low"]),
-                        "close": float(v["close"]),
-                        "volume": float(v.get("volume") or 0)
-                    })
-                except (KeyError, TypeError, ValueError):
+                    rows.append({"datetime": v["datetime"], "open": float(v["open"]), "high": float(v["high"]), "low": float(v["low"]), "close": float(v["close"]), "volume": float(v.get("volume") or 0)})
+                except Exception:
                     pass
-            err = None
+            err, source = None, "Twelve Data"
+        else:
+            err = td_err or err
 
-    result = {
-        "symbol": SYMBOL,
-        "timeframe": timeframe,
-        "candles": rows,
-        "source": "Yahoo Finance GC=F backup" if rows and err else "Twelve Data",
-        "status": "ok" if rows else "error",
-        "error": None if rows else err,
-        "updated": now_iso()
-    }
-
-    with lock:
-        candle_cache[timeframe] = {"time": time.time(), "data": result}
-
+    result = {"symbol": SYMBOL, "timeframe": timeframe, "candles": rows[-500:], "source": source, "status": "ok" if rows else "error", "error": None if rows else err, "xm360_csv_status": xm_err, "updated": now_iso()}
+    with lock: candle_cache[timeframe] = {"time": time.time(), "data": result}
     return result
-
 
 def sma(values, period):
     if len(values) < period:
@@ -385,239 +377,137 @@ def atr(candles, period=14):
     return sum(trs[-period:]) / period if len(trs) >= period else None
 
 
+def technical_snapshot(candles):
+    closes = [x["close"] for x in candles]
+    if len(closes) < 50:
+        return {"score": 0.0, "ATR": None, "reason": "Not enough candle data"}
+    e20, e50, e200 = ema(closes,20), ema(closes,50), ema(closes,200)
+    rv, ml, ms, av = rsi(closes,14), *macd(closes), atr(candles,14)
+    score = 0.0; reasons = []
+    if e20 is not None and e50 is not None:
+        score += 1 if e20 > e50 else -1
+        reasons.append("EMA20>EMA50" if e20 > e50 else "EMA20<EMA50")
+    if e200 is not None:
+        score += 1 if closes[-1] > e200 else -1
+        reasons.append("Price>EMA200" if closes[-1] > e200 else "Price<EMA200")
+    if rv is not None:
+        if rv > 55: score += .7; reasons.append("RSI bullish")
+        elif rv < 45: score -= .7; reasons.append("RSI bearish")
+    if ml is not None and ms is not None:
+        score += .8 if ml > ms else -.8
+        reasons.append("MACD bullish" if ml > ms else "MACD bearish")
+    return {"score": score, "ATR": av, "EMA20": e20, "EMA50": e50, "EMA200": e200, "RSI": rv, "MACD": ml, "MACDSignal": ms, "reason": ", ".join(reasons)}
+
+def multi_timeframe():
+    out = {}; scores = []
+    for tf in ["5m","15m","1h","4h"]:
+        d = get_candles(tf); t = technical_snapshot(d.get("candles") or [])
+        out[tf] = t; scores.append(t.get("score",0.0))
+    return out, (sum(scores)/len(scores) if scores else 0.0)
+
+def risk_plan(call, entry, atr_value):
+    if call not in ("BUY","SELL") or entry is None or atr_value is None:
+        return {"available": False}
+    risk = max(atr_value*1.25, entry*0.0015)
+    if call == "BUY":
+        sl, tp1, tp2, tp3, lock_profit = entry-risk, entry+risk, entry+risk*1.8, entry+risk*2.5, entry+risk*.5
+    else:
+        sl, tp1, tp2, tp3, lock_profit = entry+risk, entry-risk, entry-risk*1.8, entry-risk*2.5, entry-risk*.5
+    return {"available": True, "entry": round(entry,2), "stop_loss": round(sl,2), "tp1": round(tp1,2), "tp2": round(tp2,2), "tp3": round(tp3,2), "profit_lock": round(lock_profit,2), "risk_points": round(risk,2), "rr_tp1":"1:1", "rr_tp2":"1:1.8", "rr_tp3":"1:2.5", "note":"Analytical levels only; no broker order is executed."}
+
 def build_signal(candle_data):
     candles = candle_data.get("candles") or []
-    if len(candles) < 50:
-        return {
-            "call": "WAIT",
-            "buy_probability": 0.0,
-            "sell_probability": 0.0,
-            "confidence": 0.0,
-            "reason": "Not enough candle data",
-            "technical": {}
-        }
-
-    closes = [x["close"] for x in candles]
-    last = closes[-1]
-
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    e200 = ema(closes, 200)
-    rv = rsi(closes, 14)
-    ml, ms = macd(closes)
-    av = atr(candles, 14)
-
-    score = 0.0
-    reasons = []
-
-    if e20 is not None and e50 is not None:
-        if e20 > e50:
-            score += 1.0
-            reasons.append("EMA20 > EMA50")
-        else:
-            score -= 1.0
-            reasons.append("EMA20 < EMA50")
-
-    if e200 is not None:
-        if last > e200:
-            score += 1.0
-            reasons.append("Price above EMA200")
-        else:
-            score -= 1.0
-            reasons.append("Price below EMA200")
-
-    if rv is not None:
-        if rv > 55:
-            score += 0.7
-            reasons.append("RSI bullish")
-        elif rv < 45:
-            score -= 0.7
-            reasons.append("RSI bearish")
-
-    if ml is not None and ms is not None:
-        if ml > ms:
-            score += 0.8
-            reasons.append("MACD bullish")
-        else:
-            score -= 0.8
-            reasons.append("MACD bearish")
-
-    max_score = 3.5
-    buy = max(0.0, min(100.0, 50 + (score / max_score) * 50))
+    technical = technical_snapshot(candles)
+    news = get_news()
+    mtf, mtf_avg = multi_timeframe()
+    score = technical.get("score",0.0) + mtf_avg*.8
+    if news.get("news_bias") == "BULLISH": score += 1.0
+    elif news.get("news_bias") == "BEARISH": score -= 1.0
+    buy = max(0.0, min(100.0, 50 + score*13))
     sell = 100 - buy
-    confidence = min(99.0, abs(buy - sell) + 35)
+    if buy >= 65 and buy > sell: call = "BUY"
+    elif sell >= 65 and sell > buy: call = "SELL"
+    else: call = "WAIT"
+    price = get_price(); entry = price.get("price")
+    risk = risk_plan(call, entry, technical.get("ATR"))
+    confidence = round(min(95.0, 50 + abs(buy-sell)*.45), 1)
+    technical_out = {k:(round(v,4) if isinstance(v,(int,float)) else v) for k,v in technical.items() if k != "score"}
+    return {"call":call,"buy_probability":round(buy,1),"sell_probability":round(sell,1),"confidence":confidence,"timeframe":candle_data.get("timeframe"),"price":price,"technical":technical_out,"mtf":{k:{"score":round(v.get("score",0),2)} for k,v in mtf.items()},"news":{"bias":news.get("news_bias"),"score":news.get("news_score"),"article_count":len(news.get("articles",[]))},"risk":risk,"reason":"Technical + multi-timeframe + global gold-news bias","data_source":candle_data.get("source"),"updated":now_iso()}
 
-    if buy >= 62:
-        call = "BUY"
-    elif sell >= 62:
-        call = "SELL"
-    else:
-        call = "WAIT"
+GOLD_PHRASES = ["gold price","gold prices","spot gold","gold futures","gold bullion","gold market","xau/usd","xauusd","precious metals","bullion","comex gold","gold etf","gold demand"]
+MACRO_PHRASES = ["federal reserve","fed meeting","fed decision","interest rate","interest rates","rate hike","rate cut","inflation","consumer price index","cpi","treasury yield","treasury yields","bond yields","us dollar","dollar index","central bank","safe haven","oil prices","crude oil","geopolitical","middle east","sanctions","tariff","trade war","bank of japan","ecb","rbi","pboc"]
+BLOCKED_PHRASES = ["goldfish","golden retriever","golden state","golden boot","golden globe","gold medal","gold coast","golden visa","golden gate","golden ratio"]
+BULLISH_PHRASES = ["gold rises","gold rose","gold climbs","gold climbed","gold gains","gold higher","gold rebounds","gold surge","safe haven demand","rate cut","dovish","weaker dollar","dollar falls","yields fall","central bank buying"]
+BEARISH_PHRASES = ["gold falls","gold fell","gold drops","gold dropped","gold lower","gold declines","gold declined","gold slips","gold slid","gold down","rate hike","rate hikes","hawkish","stronger dollar","dollar rises","yields rise","higher yields"]
+SOURCE_WEIGHTS = {"reuters":5,"bloomberg":5,"wall street journal":4.5,"financial times":4.5,"cnbc":4,"kitco":4,"marketwatch":4,"investing.com":3.5,"fxstreet":3.5,"yahoo finance":3}
 
-    return {
-        "call": call,
-        "buy_probability": round(buy, 1),
-        "sell_probability": round(sell, 1),
-        "confidence": round(confidence, 1),
-        "reason": ", ".join(reasons),
-        "technical": {
-            "EMA20": round(e20, 3) if e20 is not None else None,
-            "EMA50": round(e50, 3) if e50 is not None else None,
-            "EMA200": round(e200, 3) if e200 is not None else None,
-            "RSI": round(rv, 2) if rv is not None else None,
-            "MACD": round(ml, 4) if ml is not None else None,
-            "ATR": round(av, 4) if av is not None else None,
-        }
-    }
+def score_news_article(article):
+    title=(article.get("title") or "").strip(); desc=(article.get("description") or "").strip()
+    if not title: return None
+    text=re.sub(r"\s+"," ",(html_lib.unescape(f"{title} {desc}")).lower()).strip()
+    title_text=title.lower()
+    if any(x in text for x in BLOCKED_PHRASES): return None
+    gold=sum(4 if p in title_text else 2 for p in GOLD_PHRASES if p in text)
+    macro=sum(1.5 for p in MACRO_PHRASES if p in text)
+    if gold < 2 and macro < 3: return None
+    source=((article.get("source") or {}).get("name") or "").lower()
+    quality=max([v for k,v in SOURCE_WEIGHTS.items() if k in source] or [1])
+    freshness=0
+    try:
+        dt=datetime.fromisoformat((article.get("publishedAt") or "").replace("Z","+00:00"))
+        age=max(0,(datetime.now(timezone.utc)-dt).total_seconds()/3600)
+        freshness=max(0,4-age/12)
+    except Exception: pass
+    impact=min(100, round(25+gold*5+macro*4+quality*6+freshness*5))
+    direction=sum(1 for p in BULLISH_PHRASES if p in text)-sum(1 for p in BEARISH_PHRASES if p in text)
+    return {"title":title,"url":article.get("url") or "","source":source or "Unknown","publishedAt":article.get("publishedAt"),"impact":impact,"direction":direction,"relevance":round(gold+macro+quality,1)}
 
+def fetch_newsapi():
+    if not NEWS_API_KEY: return []
+    q='("gold price" OR "spot gold" OR "gold futures" OR bullion OR XAU OR XAUUSD) OR (("Federal Reserve" OR Fed OR "interest rates" OR inflation OR "US dollar" OR "Treasury yields") AND (gold OR XAU OR bullion))'
+    try:
+        r=session.get("https://newsapi.org/v2/everything",params={"q":q,"language":"en","sortBy":"publishedAt","pageSize":100,"apiKey":NEWS_API_KEY},timeout=10)
+        payload=r.json()
+        if r.status_code>=400 or payload.get("status")!="ok": return []
+        return payload.get("articles",[])
+    except Exception: return []
+
+def fetch_google_news_rss():
+    queries=["gold XAU price","gold Federal Reserve interest rates","gold Australia Canada Dubai Russia China India","gold Middle East oil dollar Treasury yields"]
+    articles=[]
+    for q in queries:
+        try:
+            url="https://news.google.com/rss/search?q="+quote_plus(q)+"&hl=en-US&gl=US&ceid=US:en"
+            r=session.get(url,timeout=8)
+            if r.status_code>=400: continue
+            root=ET.fromstring(r.text)
+            for item in root.findall(".//item")[:20]:
+                articles.append({"title":item.findtext("title", ""),"description":item.findtext("description", ""),"url":item.findtext("link", ""),"source":{"name":item.findtext("source", "Google News")},"publishedAt":item.findtext("pubDate", "")})
+        except Exception: continue
+    return articles
 
 def get_news():
     with lock:
-        if cache_fresh(news_cache, NEWS_CACHE_SECONDS):
-            return news_cache["data"]
-
-    if not NEWS_API_KEY:
-        return {
-            "status": "unavailable",
-            "articles": [],
-            "message": "NEWS_API_KEY not configured"
-        }
-
-    try:
-        query = (
-            '"gold price" OR gold OR XAU OR bullion OR "gold futures" '
-            'OR "precious metals" OR "Federal Reserve" OR Fed '
-            'OR "interest rate" OR inflation OR CPI OR "US dollar" '
-            'OR USD OR "Treasury yields" OR "central bank" '
-            'OR RBI OR ECB OR BOJ OR tariff OR sanctions '
-            'OR "safe haven" OR geopolitics'
-        )
-
-        r = session.get(
-            "https://newsapi.org/v2/everything",
-            params={
-                "q": query,
-                "language": "en",
-                "sortBy": "publishedAt",
-                "pageSize": 50,
-                "apiKey": NEWS_API_KEY
-            },
-            timeout=10
-        )
-        payload = r.json()
-
-        if r.status_code >= 400 or payload.get("status") != "ok":
-            data = {
-                "status": "error",
-                "articles": [],
-                "message": payload.get("message", f"HTTP_{r.status_code}")
-            }
-        else:
-            gold_terms = [
-                "gold", "xau", "bullion", "precious metal",
-                "gold price", "gold futures"
-            ]
-
-            macro_terms = [
-                "federal reserve", "fed", "interest rate",
-                "inflation", "cpi", "us dollar", "usd",
-                "treasury yield", "bond yield", "central bank",
-                "rbi", "ecb", "boj", "tariff", "sanction",
-                "safe haven", "geopolit", "war", "oil", "crude"
-            ]
-
-            blocked_terms = [
-                "crab", "goldfish", "tap water", "water conditioner",
-                "appliance", "mental health", "nutrition",
-                "social media star", "celebrity", "medical bills",
-                "farming", "recipe", "football", "cricket",
-                "movie", "music", "entertainment"
-            ]
-
-            scored = []
-            seen = set()
-
-            for article in payload.get("articles", []):
-                title = (article.get("title") or "").strip()
-                description = (article.get("description") or "").strip()
-                text_blob = f"{title} {description}".lower()
-
-                if not title:
-                    continue
-
-                if any(term in text_blob for term in blocked_terms):
-                    continue
-
-                title_lower = title.lower()
-
-                gold_score = sum(
-                    3 if term in title_lower else 1
-                    for term in gold_terms
-                    if term in text_blob
-                )
-
-                macro_score = sum(
-                    2 if term in title_lower else 1
-                    for term in macro_terms
-                    if term in text_blob
-                )
-
-                if gold_score == 0 and macro_score < 2:
-                    continue
-
-                url = article.get("url") or ""
-                key = url or title_lower
-
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                score = gold_score + macro_score
-
-                if any(term in title_lower for term in ["gold", "xau", "bullion"]):
-                    score += 4
-
-                if any(term in title_lower for term in [
-                    "fed", "federal reserve", "interest rate",
-                    "inflation", "cpi", "dollar", "treasury yield"
-                ]):
-                    score += 2
-
-                scored.append((
-                    score,
-                    {
-                        "title": title,
-                        "url": url,
-                        "source": (article.get("source") or {}).get("name"),
-                        "publishedAt": article.get("publishedAt")
-                    }
-                ))
-
-            scored.sort(key=lambda item: item[0], reverse=True)
-
-            data = {
-                "status": "ok",
-                "articles": [item[1] for item in scored[:10]]
-            }
-
-        with lock:
-            news_cache["time"] = time.time()
-            news_cache["data"] = data
-
-        return data
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "articles": [],
-            "message": type(e).__name__
-        }
+        if cache_fresh(news_cache, NEWS_CACHE_SECONDS): return news_cache["data"]
+    raw=fetch_newsapi()+fetch_google_news_rss(); scored=[]; seen=set()
+    for article in raw:
+        item=score_news_article(article)
+        if not item: continue
+        key=re.sub(r"[^a-z0-9]+"," ",(item["url"] or item["title"]).lower()).strip()
+        if key in seen: continue
+        seen.add(key); scored.append(item)
+    scored.sort(key=lambda x:(x["impact"],x["relevance"],x.get("publishedAt") or ""),reverse=True)
+    top=scored[:20]; news_score=sum(x["direction"] for x in top)
+    bias="BULLISH" if news_score>=3 else "BEARISH" if news_score<=-3 else "MIXED"
+    data={"status":"ok" if top else "unavailable","articles":top,"news_bias":bias,"news_score":news_score,"updated":now_iso(),"sources_used":["NewsAPI","Google News RSS"] if top else []}
+    with lock: news_cache["time"]=time.time(); news_cache["data"]=data
+    return data
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "service": "Gold AI Live v6",
+        "service": "Gold AI Live v7",
         "time": now_iso()
     }
 
@@ -648,143 +538,20 @@ def news():
 
 
 HTML_PAGE = r"""
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gold AI Live v6</title>
-<style>
-body{margin:0;background:#0b1020;color:#f3f5f7;font-family:Arial,sans-serif}
-.wrap{max-width:1200px;margin:auto;padding:20px}
-h1{margin:0 0 6px;font-size:28px}
-.sub{color:#aab3c2;margin-bottom:20px}
-.tabs{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-bottom:18px}
-button{background:#1b2540;color:white;border:0;border-radius:10px;padding:13px 6px;font-weight:700}
-button.active{background:#2477ff}
-.card{background:#111a30;border:1px solid #273454;border-radius:16px;padding:18px;margin-bottom:14px}
-.price{font-size:34px;font-weight:800;margin-top:8px}
-.source{font-size:12px;color:#8fa1bd;margin-top:7px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.call{font-size:34px;font-weight:900;margin:10px 0}
-.wait{color:#ffd36b}.buy{color:#45e38c}.sell{color:#ff6b78}
-.row{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #26324e}
-.small{color:#aab3c2;font-size:13px}
-.news a{color:#8db8ff;text-decoration:none}
-@media(max-width:700px){.tabs{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:1fr}.price{font-size:30px}}
-</style>
-</head>
-<body>
-<div class="wrap">
-<h1>🥇 Gold AI Live v6</h1>
-<div class="sub">XAU/USD • Live Price • AI Technical Signal • Global News</div>
-
-<div class="tabs">
-<button data-t="1m">1m</button><button data-t="5m">5m</button>
-<button data-t="15m">15m</button><button data-t="30m">30m</button>
-<button data-t="1h">1H</button><button data-t="4h">4H</button>
-<button data-t="1d">1D</button>
-</div>
-
-<div class="card">
-<div>XAU/USD <span id="status">LIVE</span></div>
-<div class="price" id="price">Loading...</div>
-<div class="source" id="source">Connecting to market data...</div>
-</div>
-
-<div class="grid">
-<div class="card">
-<div class="small">AI CALL</div>
-<div id="call" class="call wait">WAIT</div>
-<div class="row"><span>BUY probability</span><b id="buy">0.0%</b></div>
-<div class="row"><span>SELL probability</span><b id="sell">0.0%</b></div>
-<div class="row"><span>Confidence</span><b id="confidence">0.0%</b></div>
-<div class="small" id="reason" style="margin-top:12px">Waiting for market data...</div>
-</div>
-
-<div class="card">
-<div class="small">TECHNICAL DATA</div>
-<div class="row"><span>EMA20</span><b id="ema20">-</b></div>
-<div class="row"><span>EMA50</span><b id="ema50">-</b></div>
-<div class="row"><span>EMA200</span><b id="ema200">-</b></div>
-<div class="row"><span>RSI</span><b id="rsi">-</b></div>
-<div class="row"><span>MACD</span><b id="macd">-</b></div>
-<div class="row"><span>ATR</span><b id="atr">-</b></div>
-</div>
-</div>
-
-<div class="card news">
-<div class="small">GLOBAL GOLD NEWS</div>
-<div id="news">Loading news...</div>
-</div>
-</div>
-
-<script>
-let timeframe="1h";
-
-function setActive(){
- document.querySelectorAll("button[data-t]").forEach(b=>{
-   b.classList.toggle("active",b.dataset.t===timeframe);
- });
-}
-document.querySelectorAll("button[data-t]").forEach(b=>{
- b.onclick=()=>{timeframe=b.dataset.t;setActive();loadAll()};
-});
-setActive();
-
-function put(id,v){document.getElementById(id).textContent=(v===null||v===undefined)?"-":v}
-
-async function loadPrice(){
- try{
-   const r=await fetch("/api/live-price?x="+Date.now());
-   const d=await r.json();
-   if(d.price!==null && d.price!==undefined){
-     document.getElementById("price").textContent=Number(d.price).toFixed(2);
-     document.getElementById("source").textContent="Source: "+(d.source||"market data");
-     document.getElementById("status").textContent=d.status==="backup"?"BACKUP":"LIVE";
-   }else{
-     document.getElementById("price").textContent="Waiting for data";
-     document.getElementById("source").textContent="Market provider rate-limited/unavailable";
-   }
- }catch(e){document.getElementById("price").textContent="Connection error"}
-}
-
-async function loadSignal(){
- try{
-   const r=await fetch("/api/live-signal?timeframe="+encodeURIComponent(timeframe)+"&x="+Date.now());
-   const d=await r.json();
-   const c=document.getElementById("call");
-   c.textContent=d.call||"WAIT";
-   c.className="call "+((d.call==="BUY")?"buy":(d.call==="SELL")?"sell":"wait");
-   put("buy",d.buy_probability!=null?d.buy_probability+"%":"0.0%");
-   put("sell",d.sell_probability!=null?d.sell_probability+"%":"0.0%");
-   put("confidence",d.confidence!=null?d.confidence+"%":"0.0%");
-   put("reason",d.reason||"Waiting for enough candle data");
-   const t=d.technical||{};
-   put("ema20",t.EMA20);put("ema50",t.EMA50);put("ema200",t.EMA200);
-   put("rsi",t.RSI);put("macd",t.MACD);put("atr",t.ATR);
- }catch(e){
-   document.getElementById("reason").textContent="Signal temporarily unavailable";
- }
-}
-
-async function loadNews(){
- try{
-   const r=await fetch("/api/news?x="+Date.now());
-   const d=await r.json();
-   const el=document.getElementById("news");
-   if(!d.articles || !d.articles.length){el.textContent=d.message||"News unavailable";return}
-   el.innerHTML=d.articles.map(a=>`<div style="padding:8px 0"><a target="_blank" href="${a.url||"#"}">${a.title||"Gold news"}</a><div class="small">${a.source||""}</div></div>`).join("");
- }catch(e){document.getElementById("news").textContent="News unavailable"}
-}
-
-function loadAll(){loadPrice();loadSignal()}
-loadAll();loadNews();
-setInterval(loadPrice,15000);
-setInterval(loadSignal,60000);
-setInterval(loadNews,300000);
-</script>
-</body>
-</html>
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gold AI Live v7</title>
+<style>body{margin:0;background:#09101d;color:#f4f6f8;font-family:Arial,sans-serif}.wrap{max-width:1200px;margin:auto;padding:14px}h1{font-size:25px;margin:0 0 5px}.sub,.small{color:#9eabc0;font-size:13px}.tabs{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin:14px 0}button{background:#1a2740;color:#fff;border:0;border-radius:9px;padding:11px 3px;font-weight:700}button.active{background:#2677ff}.card{background:#101a2c;border:1px solid #263653;border-radius:15px;padding:15px;margin-bottom:12px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.price{font-size:34px;font-weight:900;margin-top:7px}.call{font-size:32px;font-weight:900;margin:8px 0}.buy{color:#43e28c}.sell{color:#ff6c79}.wait{color:#ffd36c}.row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #24314a}.news a{color:#8fbaff;text-decoration:none}@media(max-width:700px){.tabs{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:1fr}.price{font-size:30px}}</style></head><body><div class="wrap">
+<h1>🥇 Gold AI Live v7</h1><div class="sub">XAU/USD • XM360-focused candles • Technical + Multi-Timeframe + Global News</div>
+<div class="tabs"><button data-t="1m">1m</button><button data-t="5m">5m</button><button data-t="15m">15m</button><button data-t="30m">30m</button><button data-t="1h">1H</button><button data-t="4h">4H</button><button data-t="1d">1D</button></div>
+<div class="card"><div>XAU/USD <span id="status">LIVE</span></div><div id="price" class="price">Loading...</div><div id="source" class="small">Market data...</div></div>
+<div class="grid"><div class="card"><div class="small">AI MARKET CALL</div><div id="call" class="call wait">WAIT</div><div class="row"><span>BUY possibility</span><b id="buy">-</b></div><div class="row"><span>SELL possibility</span><b id="sell">-</b></div><div class="row"><span>Model confidence</span><b id="conf">-</b></div><div class="row"><span>Global news bias</span><b id="nbias">-</b></div><div class="row"><span>News articles</span><b id="ncount">-</b></div><div class="small" id="reason">Waiting...</div></div>
+<div class="card"><div class="small">XM360 / MARKET CANDLE ANALYSIS</div><div class="row"><span>Candle source</span><b id="csource">-</b></div><div class="row"><span>EMA20</span><b id="e20">-</b></div><div class="row"><span>EMA50</span><b id="e50">-</b></div><div class="row"><span>EMA200</span><b id="e200">-</b></div><div class="row"><span>RSI</span><b id="rsi">-</b></div><div class="row"><span>MACD</span><b id="macd">-</b></div><div class="row"><span>ATR</span><b id="atr">-</b></div></div></div>
+<div class="card"><div class="small">STOP LOSS / TAKE PROFIT / PROFIT LOCK</div><div class="row"><span>Entry</span><b id="entry">-</b></div><div class="row"><span>Stop Loss</span><b id="sl">-</b></div><div class="row"><span>TP1</span><b id="tp1">-</b></div><div class="row"><span>TP2</span><b id="tp2">-</b></div><div class="row"><span>TP3</span><b id="tp3">-</b></div><div class="row"><span>Profit Lock</span><b id="plock">-</b></div><div class="small">Analytical levels only. The app does not place broker orders.</div></div>
+<div class="card"><div class="small">GLOBAL GOLD NEWS</div><div id="news">Loading...</div></div></div>
+<script>let tf="1h";const $=id=>document.getElementById(id);function put(id,v){$(id).textContent=v===null||v===undefined?"-":v}document.querySelectorAll("[data-t]").forEach(b=>b.onclick=()=>{tf=b.dataset.t;document.querySelectorAll("[data-t]").forEach(x=>x.classList.toggle("active",x===b));loadSignal()});document.querySelector('[data-t="1h"]').classList.add("active");
+async function loadPrice(){try{let d=await(await fetch("/api/live-price?x="+Date.now())).json();put("price",d.price!=null?Number(d.price).toFixed(2):"Waiting");put("source","Source: "+(d.source||"-"));put("status",d.status==="backup"?"BACKUP":"LIVE")}catch(e){put("price","Error")}}
+async function loadSignal(){try{let d=await(await fetch("/api/live-signal?timeframe="+encodeURIComponent(tf)+"&x="+Date.now())).json();let c=$("call");c.textContent=d.call||"WAIT";c.className="call "+(d.call==="BUY"?"buy":d.call==="SELL"?"sell":"wait");put("buy",(d.buy_probability??"-")+"%");put("sell",(d.sell_probability??"-")+"%");put("conf",(d.confidence??"-")+"%");put("nbias",d.news?.bias||"-");put("ncount",d.news?.article_count??"-");put("reason",d.reason||"-");put("csource",d.data_source||"-");let t=d.technical||{};put("e20",t.EMA20);put("e50",t.EMA50);put("e200",t.EMA200);put("rsi",t.RSI);put("macd",t.MACD);put("atr",t.ATR);let r=d.risk||{};put("entry",r.entry);put("sl",r.stop_loss);put("tp1",r.tp1);put("tp2",r.tp2);put("tp3",r.tp3);put("plock",r.profit_lock)}catch(e){put("reason","Signal temporarily unavailable")}}
+async function loadNews(){try{let d=await(await fetch("/api/news?x="+Date.now())).json();if(!d.articles?.length){$("news").textContent=d.message||"News unavailable";return}$("news").innerHTML=d.articles.map(a=>`<div style="padding:8px 0;border-bottom:1px solid #24314a"><a target="_blank" rel="noopener" href="${a.url||"#"}">${a.title||"Gold news"}</a><div class="small">${a.source||""} • impact ${a.impact||"-"} • ${a.direction>0?"bullish":a.direction<0?"bearish":"neutral"}</div></div>`).join("")}catch(e){$("news").textContent="News unavailable"}}
+function loadAll(){loadPrice();loadSignal();loadNews()}loadAll();setInterval(loadPrice,15000);setInterval(loadSignal,60000);setInterval(loadNews,600000);</script></body></html>
 """
 
 
@@ -796,7 +563,7 @@ def dashboard():
 @app.on_event("startup")
 def startup_event():
     print("====================================")
-    print(" GOLD AI LIVE v6 STARTED")
+    print(" GOLD AI LIVE v7 STARTED")
     print(" Twelve Data primary")
     print(" Yahoo GC=F backup")
     print(" Price cache: 15 sec")
