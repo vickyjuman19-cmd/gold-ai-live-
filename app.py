@@ -1,2231 +1,855 @@
 import os
-import requests
+import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+import requests
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from dotenv import load_dotenv
-
-
-# ============================================================
-# GOLD AI LIVE v4
-# ============================================================
 
 load_dotenv()
 
-app = FastAPI(
-    title="Gold AI Live v4",
-    version="4.0"
-)
+app = FastAPI(title="Gold AI Live v5")
 
+PRICE_API_KEY = os.getenv("PRICE_API_KEY", "").strip()
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 
-# ============================================================
-# API CONFIG
-# ============================================================
+SYMBOL = "XAU/USD"
 
-PRICE_API_KEY = os.getenv(
-    "PRICE_API_KEY",
-    ""
-)
+# =========================================================
+# CACHE / THROTTLING
+# =========================================================
 
-TD = "https://api.twelvedata.com"
-
-GDELT = (
-    "https://api.gdeltproject.org/api/v2/doc/doc"
-)
-
-
-TIMEFRAMES = [
-    "1m",
-    "5m",
-    "15m",
-    "30m",
-    "1H",
-    "4H",
-    "1D"
-]
-
-
-TD_INTERVALS = {
-
-    "1m": "1min",
-
-    "5m": "5min",
-
-    "15m": "15min",
-
-    "30m": "30min",
-
-    "1H": "1h",
-
-    "4H": "4h",
-
-    "1D": "1day"
+PRICE_CACHE = {
+    "data": None,
+    "time": 0.0,
 }
 
+CANDLE_CACHE = {}
 
-# ============================================================
-# REFRESH SETTINGS
-# ============================================================
-
-PRICE_CACHE_SECONDS = 3
-
-SIGNAL_CACHE_SECONDS = 10
-
-NEWS_CACHE_SECONDS = 60
-
-
-# ============================================================
-# CACHES
-# ============================================================
+NEWS_CACHE = {
+    "data": None,
+    "time": 0.0,
+}
 
 CACHE_LOCK = threading.Lock()
 
+PRICE_CACHE_SECONDS = 15
+CANDLE_CACHE_SECONDS = 60
+NEWS_CACHE_SECONDS = 300
 
-PRICE_CACHE = {
+MIN_PRICE_REQUEST_GAP = 15
+MIN_CANDLE_REQUEST_GAP = 60
 
-    "data": None,
-
-    "updated": 0
-}
-
-
-NEWS_CACHE = {
-
-    "items": [],
-
-    "updated": 0
-}
+LAST_PRICE_REQUEST = 0.0
+LAST_CANDLE_REQUEST = 0.0
 
 
-TECH_CACHE = {}
+# =========================================================
+# HTTP SESSION
+# =========================================================
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Gold-AI-Live/5.0"
+})
 
 
-# ============================================================
-# TWELVE DATA REQUEST
-# ============================================================
+# =========================================================
+# SAFE REQUEST
+# =========================================================
 
-def td_get(path, params):
-
-    if not PRICE_API_KEY:
-
-        raise RuntimeError(
-            "PRICE_API_KEY is missing"
+def safe_get(url, params=None, timeout=12):
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=timeout
         )
 
+        if response.status_code == 429:
+            return {
+                "ok": False,
+                "error": "RATE_LIMIT",
+                "status": 429
+            }
 
-    p = dict(params)
+        if response.status_code != 200:
+            return {
+                "ok": False,
+                "error": f"HTTP_{response.status_code}",
+                "status": response.status_code
+            }
 
-    p["apikey"] = PRICE_API_KEY
-
-
-    r = requests.get(
-
-        TD + path,
-
-        params=p,
-
-        timeout=5
-    )
-
-
-    r.raise_for_status()
-
-
-    d = r.json()
-
-
-    if (
-
-        d.get("status") == "error"
-
-        or
-
-        d.get("code")
-
-    ):
-
-        raise RuntimeError(
-
-            d.get(
-                "message",
-                "Twelve Data error"
-            )
-
-        )
-
-
-    return d
-
-
-# ============================================================
-# LIVE PRICE
-# ============================================================
-
-def get_price():
-
-    now = datetime.now(
-        timezone.utc
-    ).timestamp()
-
-
-    with CACHE_LOCK:
-
-        if (
-
-            PRICE_CACHE["data"]
-
-            is not None
-
-            and
-
-            now
-            -
-            PRICE_CACHE["updated"]
-
-            <
-            PRICE_CACHE_SECONDS
-
-        ):
-
-            return PRICE_CACHE["data"]
-
-
-    d = td_get(
-
-        "/quote",
-
-        {
-            "symbol":
-                "XAU/USD"
+        return {
+            "ok": True,
+            "data": response.json()
         }
 
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+# =========================================================
+# PRICE
+# =========================================================
+
+def get_live_price():
+
+    global LAST_PRICE_REQUEST
+
+    now = time.time()
+
+    with CACHE_LOCK:
+        if (
+            PRICE_CACHE["data"] is not None
+            and now - PRICE_CACHE["time"] < PRICE_CACHE_SECONDS
+        ):
+            return PRICE_CACHE["data"]
+
+        # Prevent multiple simultaneous API calls
+        if now - LAST_PRICE_REQUEST < MIN_PRICE_REQUEST_GAP:
+            if PRICE_CACHE["data"] is not None:
+                return PRICE_CACHE["data"]
+
+            return {
+                "symbol": SYMBOL,
+                "price": None,
+                "status": "waiting"
+            }
+
+        LAST_PRICE_REQUEST = now
+
+    if not PRICE_API_KEY:
+        return {
+            "symbol": SYMBOL,
+            "price": None,
+            "status": "missing_api_key"
+        }
+
+    url = "https://api.twelvedata.com/price"
+
+    result = safe_get(
+        url,
+        params={
+            "symbol": SYMBOL,
+            "apikey": PRICE_API_KEY
+        }
     )
 
+    if not result["ok"]:
 
-    p = (
+        if result.get("error") == "RATE_LIMIT":
+            with CACHE_LOCK:
+                if PRICE_CACHE["data"] is not None:
+                    return PRICE_CACHE["data"]
 
-        d.get("price")
+        return {
+            "symbol": SYMBOL,
+            "price": None,
+            "status": "error",
+            "error": result.get("error")
+        }
 
-        or
+    data = result["data"]
 
-        d.get("close")
+    try:
+        price = float(data.get("price"))
+    except Exception:
+        price = None
 
-    )
-
-
-    if p is None:
-
-        raise RuntimeError(
-            "No current XAU/USD price"
-        )
-
-
-    p = float(p)
-
-
-    result = {
-
-        "price":
-            p,
-
-        "bid":
-            float(
-                d.get("bid")
-                or p
-            ),
-
-        "ask":
-            float(
-                d.get("ask")
-                or p
-            ),
-
-        "source":
-            "Twelve Data LIVE",
-
-        "datetime":
-            d.get(
-                "datetime",
-                ""
-            )
+    output = {
+        "symbol": SYMBOL,
+        "price": price,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "ok"
     }
 
+    with CACHE_LOCK:
+        PRICE_CACHE["data"] = output
+        PRICE_CACHE["time"] = time.time()
+
+    return output
+
+
+# =========================================================
+# CANDLES
+# =========================================================
+
+def get_candles(interval="1h", outputsize=200):
+
+    global LAST_CANDLE_REQUEST
+
+    now = time.time()
+
+    cache_key = f"{interval}_{outputsize}"
 
     with CACHE_LOCK:
 
-        PRICE_CACHE["data"] = result
+        cached = CANDLE_CACHE.get(cache_key)
 
-        PRICE_CACHE["updated"] = now
+        if cached:
+            if now - cached["time"] < CANDLE_CACHE_SECONDS:
+                return cached["data"]
 
+        if now - LAST_CANDLE_REQUEST < MIN_CANDLE_REQUEST_GAP:
+
+            if cached:
+                return cached["data"]
+
+            return {
+                "status": "waiting",
+                "values": []
+            }
+
+        LAST_CANDLE_REQUEST = now
+
+    if not PRICE_API_KEY:
+        return {
+            "status": "missing_api_key",
+            "values": []
+        }
+
+    url = "https://api.twelvedata.com/time_series"
+
+    result = safe_get(
+        url,
+        params={
+            "symbol": SYMBOL,
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": PRICE_API_KEY,
+            "format": "JSON"
+        },
+        timeout=15
+    )
+
+    if not result["ok"]:
+
+        if result.get("error") == "RATE_LIMIT":
+
+            with CACHE_LOCK:
+                cached = CANDLE_CACHE.get(cache_key)
+
+            if cached:
+                return cached["data"]
+
+        return {
+            "status": "error",
+            "values": [],
+            "error": result.get("error")
+        }
+
+    raw = result["data"]
+
+    values = raw.get("values", [])
+
+    if not values:
+        return {
+            "status": "error",
+            "values": [],
+            "error": raw.get("message", "No candle data")
+        }
+
+    candles = []
+
+    for item in reversed(values):
+
+        try:
+
+            candles.append({
+                "datetime": item.get("datetime"),
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+            })
+
+        except Exception:
+            continue
+
+    output = {
+        "status": "ok",
+        "interval": interval,
+        "values": candles
+    }
+
+    with CACHE_LOCK:
+        CANDLE_CACHE[cache_key] = {
+            "data": output,
+            "time": time.time()
+        }
+
+    return output
+
+
+# =========================================================
+# INDICATORS
+# =========================================================
+
+def sma(values, period):
+
+    if len(values) < period:
+        return None
+
+    return sum(values[-period:]) / period
+
+
+def ema(values, period):
+
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+
+    result = sum(values[:period]) / period
+
+    for price in values[period:]:
+        result = (
+            (price - result) * multiplier
+        ) + result
 
     return result
 
 
-# ============================================================
-# CANDLES
-# ============================================================
+def calculate_rsi(values, period=14):
 
-def get_candles(
-    tf,
-    outputsize=250
-):
-
-    d = td_get(
-
-        "/time_series",
-
-        {
-
-            "symbol":
-                "XAU/USD",
-
-            "interval":
-                TD_INTERVALS[tf],
-
-            "outputsize":
-                outputsize,
-
-            "order":
-                "ASC"
-
-        }
-
-    )
-
-
-    vals = (
-        d.get("values")
-        or []
-    )
-
-
-    rows = []
-
-
-    for x in vals:
-
-        try:
-
-            rows.append({
-
-                "datetime":
-                    x.get(
-                        "datetime",
-                        ""
-                    ),
-
-                "open":
-                    float(
-                        x["open"]
-                    ),
-
-                "high":
-                    float(
-                        x["high"]
-                    ),
-
-                "low":
-                    float(
-                        x["low"]
-                    ),
-
-                "close":
-                    float(
-                        x["close"]
-                    )
-
-            })
-
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError
-        ):
-
-            pass
-
-
-    if len(rows) < 60:
-
-        raise RuntimeError(
-
-            f"Not enough candles "
-            f"for {tf}: "
-            f"{len(rows)}"
-
-        )
-
-
-    return rows
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def ema(v, n):
-
-    if not v:
-
-        return []
-
-
-    k = 2 / (n + 1)
-
-
-    out = [
-        v[0]
-    ]
-
-
-    for x in v[1:]:
-
-        out.append(
-
-            x * k
-
-            +
-
-            out[-1]
-            *
-            (1 - k)
-
-        )
-
-
-    return out
-
-
-# ============================================================
-# RSI
-# ============================================================
-
-def rsi(v, n=14):
-
-    if len(v) < n + 1:
-
-        return 50.0
-
+    if len(values) <= period:
+        return None
 
     gains = []
-
     losses = []
 
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
 
-    for i in range(
-        1,
-        len(v)
-    ):
+        if change >= 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
 
-        ch = (
-            v[i]
-            -
-            v[i - 1]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+
+        avg_gain = (
+            (avg_gain * (period - 1))
+            + gains[i]
+        ) / period
+
+        avg_loss = (
+            (avg_loss * (period - 1))
+            + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+
+    return 100 - (100 / (1 + rs))
+
+
+def calculate_macd(values):
+
+    e12 = ema(values, 12)
+    e26 = ema(values, 26)
+
+    if e12 is None or e26 is None:
+        return None
+
+    macd = e12 - e26
+
+    return macd
+
+
+def calculate_atr(candles, period=14):
+
+    if len(candles) <= period:
+        return None
+
+    true_ranges = []
+
+    for i in range(1, len(candles)):
+
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
         )
 
+        true_ranges.append(tr)
 
-        gains.append(
-            max(ch, 0)
-        )
-
-
-        losses.append(
-            max(-ch, 0)
-        )
+    return sum(true_ranges[-period:]) / period
 
 
-    ag = (
-        sum(
-            gains[:n]
-        )
-        /
-        n
-    )
+# =========================================================
+# SIGNAL ENGINE
+# =========================================================
 
+def generate_signal(candles):
 
-    al = (
-        sum(
-            losses[:n]
-        )
-        /
-        n
-    )
+    if len(candles) < 50:
 
+        return {
+            "signal": "WAIT",
+            "buy_probability": 0,
+            "sell_probability": 0,
+            "confidence": 0,
+            "reason": "Not enough market data"
+        }
 
-    for i in range(
-        n,
-        len(gains)
-    ):
+    closes = [x["close"] for x in candles]
 
-        ag = (
+    current = closes[-1]
 
-            ag * (n - 1)
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    ema200 = ema(closes, 200)
 
-            +
+    rsi = calculate_rsi(closes)
+    macd = calculate_macd(closes)
+    atr = calculate_atr(candles)
 
-            gains[i]
+    buy_score = 0
+    sell_score = 0
 
-        ) / n
+    reasons = []
 
+    # EMA 20 / 50
+    if ema20 and ema50:
 
-        al = (
+        if ema20 > ema50:
+            buy_score += 20
+            reasons.append("EMA20 above EMA50")
 
-            al * (n - 1)
+        elif ema20 < ema50:
+            sell_score += 20
+            reasons.append("EMA20 below EMA50")
 
-            +
+    # EMA 200
+    if ema200:
 
-            losses[i]
-
-        ) / n
-
-
-    if al == 0:
-
-        return (
-            100.0
-            if ag > 0
-            else 50.0
-        )
-
-
-    rs = ag / al
-
-
-    return (
-
-        100
-
-        -
-
-        (
-            100
-            /
-            (1 + rs)
-        )
-
-    )
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-def atr(rows, n=14):
-
-    tr = []
-
-
-    for i, x in enumerate(rows):
-
-        if i == 0:
-
-            t = (
-
-                x["high"]
-                -
-                x["low"]
-
-            )
+        if current > ema200:
+            buy_score += 20
+            reasons.append("Price above EMA200")
 
         else:
-
-            pc = rows[
-                i - 1
-            ]["close"]
-
-
-            t = max(
-
-                x["high"]
-                -
-                x["low"],
-
-                abs(
-                    x["high"]
-                    -
-                    pc
-                ),
-
-                abs(
-                    x["low"]
-                    -
-                    pc
-                )
-
-            )
-
-
-        tr.append(t)
-
-
-    if len(tr) < n:
-
-        return 0.01
-
-
-    a = (
-
-        sum(
-            tr[:n]
-        )
-        /
-        n
-
-    )
-
-
-    for x in tr[n:]:
-
-        a = (
-
-            a * (n - 1)
-
-            +
-
-            x
-
-        ) / n
-
-
-    return max(
-        a,
-        0.01
-    )
-
-
-# ============================================================
-# MACD
-# ============================================================
-
-def macd(v):
-
-    e12 = ema(
-        v,
-        12
-    )
-
-
-    e26 = ema(
-        v,
-        26
-    )
-
-
-    line = [
-
-        a - b
-
-        for a, b
-        in zip(
-            e12,
-            e26
-        )
-
-    ]
-
-
-    sig = ema(
-        line,
-        9
-    )
-
-
-    return (
-
-        line[-1],
-
-        sig[-1],
-
-        line[-1]
-        -
-        sig[-1]
-
-    )
-
-
-# ============================================================
-# TECHNICAL ENGINE
-# ============================================================
-
-def technical(rows):
-
-    c = [
-
-        x["close"]
-
-        for x in rows
-
-    ]
-
-
-    p = c[-1]
-
-
-    e20 = ema(
-        c,
-        20
-    )[-1]
-
-
-    e50 = ema(
-        c,
-        50
-    )[-1]
-
-
-    e200 = ema(
-        c,
-        200
-    )[-1]
-
-
-    r = rsi(c)
-
-
-    ml, ms, mh = macd(c)
-
-
-    a = atr(rows)
-
-
-    score = 0.0
-
-
-    # Price vs EMA20
-
-    score += (
-
-        1
-        if p > e20
-        else -1
-
-    )
-
-
-    # EMA20 vs EMA50
-
-    score += (
-
-        1
-        if e20 > e50
-        else -1
-
-    )
-
-
-    # Price vs EMA200
-
-    score += (
-
-        1
-        if p > e200
-        else -1
-
-    )
-
+            sell_score += 20
+            reasons.append("Price below EMA200")
 
     # RSI
+    if rsi is not None:
 
-    if 52 <= r <= 68:
+        if rsi < 30:
+            buy_score += 20
+            reasons.append("RSI oversold")
 
-        score += 1
+        elif rsi > 70:
+            sell_score += 20
+            reasons.append("RSI overbought")
 
-    elif 32 <= r <= 48:
+        elif rsi >= 50:
+            buy_score += 10
 
-        score -= 1
-
-    elif r > 72:
-
-        score -= 0.5
-
-    elif r < 28:
-
-        score += 0.5
-
+        else:
+            sell_score += 10
 
     # MACD
+    if macd is not None:
 
-    score += (
+        if macd > 0:
+            buy_score += 20
+            reasons.append("MACD positive")
 
-        1
-        if mh > 0
-        else -1
-
-    )
-
+        else:
+            sell_score += 20
+            reasons.append("MACD negative")
 
     # Momentum
+    if len(closes) >= 6:
 
-    if len(c) >= 4:
+        if current > closes[-6]:
+            buy_score += 10
 
-        if c[-1] > c[-4]:
+        else:
+            sell_score += 10
 
-            score += 0.5
+    total = buy_score + sell_score
 
-        elif c[-1] < c[-4]:
+    if total <= 0:
 
-            score -= 0.5
+        buy_probability = 50
+        sell_probability = 50
 
+    else:
 
-    norm = max(
-
-        -1,
-
-        min(
-            1,
-            score / 5.5
+        buy_probability = round(
+            (buy_score / total) * 100,
+            1
         )
 
+        sell_probability = round(
+            (sell_score / total) * 100,
+            1
+        )
+
+    if buy_probability >= 60:
+
+        signal = "BUY"
+
+    elif sell_probability >= 60:
+
+        signal = "SELL"
+
+    else:
+
+        signal = "WAIT"
+
+    confidence = round(
+        max(buy_probability, sell_probability),
+        1
     )
 
-
     return {
-
-        "price":
-            p,
-
-        "ema20":
-            e20,
-
-        "ema50":
-            e50,
-
-        "ema200":
-            e200,
-
-        "rsi":
-            r,
-
-        "macd":
-            ml,
-
-        "macd_signal":
-            ms,
-
-        "macd_hist":
-            mh,
-
-        "atr":
-            a,
-
-        "norm":
-            norm
-
+        "signal": signal,
+        "buy_probability": buy_probability,
+        "sell_probability": sell_probability,
+        "confidence": confidence,
+        "price": current,
+        "ema20": ema20,
+        "ema50": ema50,
+        "ema200": ema200,
+        "rsi": rsi,
+        "macd": macd,
+        "atr": atr,
+        "reason": reasons
     }
 
 
-# ============================================================
-# GOLD NEWS
-# ============================================================
+# =========================================================
+# NEWS
+# =========================================================
 
-def gdelt_news():
+def get_news():
 
-    now = datetime.now(
-        timezone.utc
-    ).timestamp()
-
-
-    # Fast cache
+    now = time.time()
 
     with CACHE_LOCK:
 
         if (
-
-            NEWS_CACHE["items"]
-
-            and
-
-            now
-            -
-            NEWS_CACHE["updated"]
-
-            <
-            NEWS_CACHE_SECONDS
-
+            NEWS_CACHE["data"] is not None
+            and now - NEWS_CACHE["time"] < NEWS_CACHE_SECONDS
         ):
+            return NEWS_CACHE["data"]
 
-            return {
-
-                "items":
-                    NEWS_CACHE["items"],
-
-                "status":
-                    "CACHE",
-
-                "updated":
-                    NEWS_CACHE["updated"]
-
-            }
-
-
-    query = (
-
-        '(gold OR XAUUSD OR '
-        '"XAU/USD" OR bullion) AND '
-
-        '(Fed OR "Federal Reserve" '
-        'OR inflation OR CPI OR PPI '
-        'OR yields OR dollar OR USD '
-        'OR Treasury OR geopolitics '
-        'OR war OR conflict OR tariff '
-        'OR "central bank" '
-        'OR "interest rate" '
-        'OR recession)'
-
-    )
-
-
-    try:
-
-        r = requests.get(
-
-            GDELT,
-
-            params={
-
-                "query":
-                    query,
-
-                "mode":
-                    "artlist",
-
-                "maxrecords":
-                    20,
-
-                "format":
-                    "json",
-
-                "sort":
-                    "datedesc",
-
-                "timespan":
-                    "24h"
-
-            },
-
-            timeout=4
-
-        )
-
-
-        r.raise_for_status()
-
-
-        data = r.json()
-
-
-        articles = (
-            data.get(
-                "articles",
-                []
-            )
-        )
-
-
-        items = []
-
-
-        for a in articles[:20]:
-
-            title = (
-
-                a.get(
-                    "title",
-                    ""
-                )
-
-                or ""
-
-            ).strip()
-
-
-            url = (
-
-                a.get(
-                    "url",
-                    ""
-                )
-
-                or ""
-
-            ).strip()
-
-
-            if not title or not url:
-
-                continue
-
-
-            items.append({
-
-                "title":
-                    title,
-
-                "url":
-                    url,
-
-                "source":
-                    a.get(
-                        "domain",
-                        ""
-                    ),
-
-                "published":
-                    a.get(
-                        "seendate",
-                        ""
-                    )
-
-            })
-
-
-        if items:
-
-            with CACHE_LOCK:
-
-                NEWS_CACHE["items"] = items
-
-                NEWS_CACHE["updated"] = now
-
-
-            return {
-
-                "items":
-                    items,
-
-                "status":
-                    "LIVE",
-
-                "updated":
-                    now
-
-            }
-
-
-        with CACHE_LOCK:
-
-            if NEWS_CACHE["items"]:
-
-                return {
-
-                    "items":
-                        NEWS_CACHE["items"],
-
-                    "status":
-                        "CACHE",
-
-                    "updated":
-                        NEWS_CACHE["updated"]
-
-                }
-
+    if not NEWS_API_KEY:
 
         return {
-
-            "items": [],
-
-            "status":
-                "NO_DATA",
-
-            "updated":
-                0
-
+            "status": "disabled",
+            "articles": []
         }
 
+    url = "https://newsapi.org/v2/everything"
 
-    except Exception:
-
-        with CACHE_LOCK:
-
-            if NEWS_CACHE["items"]:
-
-                return {
-
-                    "items":
-                        NEWS_CACHE["items"],
-
-                    "status":
-                        "CACHE",
-
-                    "updated":
-                        NEWS_CACHE["updated"]
-
-                }
-
-
-        return {
-
-            "items": [],
-
-            "status":
-                "UNAVAILABLE",
-
-            "updated":
-                0
-
-        }
-
-
-# ============================================================
-# NEWS SCORE
-# ============================================================
-
-def news_score(items):
-
-    bull = [
-
-        "rate cut",
-        "rate cuts",
-        "dovish",
-        "lower yields",
-        "falling yields",
-        "weaker dollar",
-        "weak dollar",
-        "safe haven",
-        "war",
-        "conflict",
-        "geopolitical",
-        "geopolitics",
-        "central bank buying",
-        "central banks buying",
-        "tariff",
-        "trade war",
-        "recession",
-        "economic slowdown",
-        "rate reduction"
-
-    ]
-
-
-    bear = [
-
-        "rate hike",
-        "rate hikes",
-        "hawkish",
-        "higher yields",
-        "rising yields",
-        "strong dollar",
-        "strong usd",
-        "hot inflation",
-        "cpi above",
-        "ppi above",
-        "fed tightening",
-        "monetary tightening",
-        "rate increase",
-        "higher interest rates"
-
-    ]
-
-
-    bullish = 0
-
-    bearish = 0
-
-
-    for item in items:
-
-        title = (
-
-            item.get(
-                "title",
-                ""
-            )
-
-            or ""
-
-        ).lower()
-
-
-        bullish += sum(
-
-            word in title
-
-            for word in bull
-
-        )
-
-
-        bearish += sum(
-
-            word in title
-
-            for word in bear
-
-        )
-
-
-    total = (
-        bullish
-        +
-        bearish
+    result = safe_get(
+        url,
+        params={
+            "q": "gold OR XAUUSD OR Federal Reserve OR inflation",
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": 10,
+            "apiKey": NEWS_API_KEY
+        },
+        timeout=15
     )
 
-
-    if total == 0:
+    if not result["ok"]:
 
         return {
-
-            "score":
-                50,
-
-            "bias":
-                "NEUTRAL",
-
-            "bullish":
-                0,
-
-            "bearish":
-                0
-
+            "status": "error",
+            "articles": []
         }
 
+    raw = result["data"]
 
-    score = max(
+    articles = []
 
-        0,
+    for item in raw.get("articles", [])[:10]:
 
-        min(
+        articles.append({
+            "title": item.get("title"),
+            "description": item.get("description"),
+            "url": item.get("url"),
+            "publishedAt": item.get("publishedAt")
+        })
 
-            100,
-
-            50
-            +
-            45
-            *
-            (
-                bullish
-                -
-                bearish
-            )
-            /
-            max(
-                1,
-                total
-            )
-
-        )
-
-    )
-
-
-    if score >= 60:
-
-        bias = "BULLISH"
-
-    elif score <= 40:
-
-        bias = "BEARISH"
-
-    else:
-
-        bias = "NEUTRAL"
-
-
-    return {
-
-        "score":
-            round(
-                score,
-                1
-            ),
-
-        "bias":
-            bias,
-
-        "bullish":
-            bullish,
-
-        "bearish":
-            bearish
-
+    output = {
+        "status": "ok",
+        "articles": articles
     }
-
-
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
-
-def build_signal(
-    t,
-    n
-):
-
-    tech = t["norm"]
-
-
-    news = (
-
-        n["score"]
-        -
-        50
-    ) / 50
-
-
-    combined = (
-
-        0.75 * tech
-
-        +
-
-        0.25 * news
-
-    )
-
-
-    buy = (
-
-        50
-        +
-        combined
-        *
-        38
-
-    )
-
-
-    sell = (
-        100
-        -
-        buy
-    )
-
-
-    # --------------------------------------------------------
-    # NORMAL SIGNAL
-    # --------------------------------------------------------
-
-    if abs(combined) < 0.22:
-
-        action = "NO TRADE"
-
-
-    elif combined > 0:
-
-        action = "BUY"
-
-
-    else:
-
-        action = "SELL"
-
-
-    # --------------------------------------------------------
-    # STRONG SIGNAL
-    # --------------------------------------------------------
-
-    if combined >= 0.70:
-
-        strength = "STRONG BUY"
-
-    elif combined >= 0.35:
-
-        strength = "BUY"
-
-    elif combined <= -0.70:
-
-        strength = "STRONG SELL"
-
-    elif combined <= -0.35:
-
-        strength = "SELL"
-
-    else:
-
-        strength = "NO TRADE"
-
-
-    confidence = min(
-
-        95,
-
-        max(
-
-            50,
-
-            50
-            +
-            abs(combined)
-            *
-            45
-
-        )
-
-    )
-
-
-    entry = t["price"]
-
-
-    risk = (
-        t["atr"]
-        *
-        1.5
-    )
-
-
-    if strength in (
-        "BUY",
-        "STRONG BUY"
-    ):
-
-        sl = (
-            entry
-            -
-            risk
-        )
-
-        tp1 = (
-            entry
-            +
-            risk * 1.5
-        )
-
-        tp2 = (
-            entry
-            +
-            risk * 2.5
-        )
-
-
-    elif strength in (
-        "SELL",
-        "STRONG SELL"
-    ):
-
-        sl = (
-            entry
-            +
-            risk
-        )
-
-        tp1 = (
-            entry
-            -
-            risk * 1.5
-        )
-
-        tp2 = (
-            entry
-            -
-            risk * 2.5
-        )
-
-
-    else:
-
-        sl = None
-
-        tp1 = None
-
-        tp2 = None
-
-
-    return {
-
-        "buy":
-            round(
-                buy,
-                1
-            ),
-
-        "sell":
-            round(
-                sell,
-                1
-            ),
-
-        "confidence":
-            round(
-                confidence,
-                1
-            ),
-
-        "signal":
-            action,
-
-        "strength":
-            strength,
-
-        "entry":
-            round(
-                entry,
-                2
-            ),
-
-        "stop_loss":
-
-            round(
-                sl,
-                2
-            )
-            if sl is not None
-            else None,
-
-        "tp1":
-
-            round(
-                tp1,
-                2
-            )
-            if tp1 is not None
-            else None,
-
-        "tp2":
-
-            round(
-                tp2,
-                2
-            )
-            if tp2 is not None
-            else None,
-
-        "risk_reward":
-
-            "1:1.5 / 1:2.5"
-            if strength != "NO TRADE"
-            else "—",
-
-        "reason":
-
-            (
-                "Strong technical + "
-                "news confluence."
-                if strength.startswith(
-                    "STRONG"
-                )
-                else
-                "Technical + news "
-                "confluence supports "
-                + strength
-                + "."
-                if strength != "NO TRADE"
-                else
-                "Factors are not "
-                "sufficiently aligned."
-            )
-
-    }
-
-
-# ============================================================
-# FAST TECHNICAL CACHE
-# ============================================================
-
-def get_signal_data(
-    timeframe
-):
-
-    now = datetime.now(
-        timezone.utc
-    ).timestamp()
-
 
     with CACHE_LOCK:
+        NEWS_CACHE["data"] = output
+        NEWS_CACHE["time"] = time.time()
 
-        cached = TECH_CACHE.get(
-            timeframe
-        )
-
-
-        if cached:
-
-            if (
-
-                now
-                -
-                cached["updated"]
-
-                <
-                SIGNAL_CACHE_SECONDS
-
-            ):
-
-                return cached
+    return output
 
 
-    rows = get_candles(
-        timeframe
-    )
+# =========================================================
+# API ROUTES
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return HTMLResponse(HTML_PAGE)
 
 
-    t = technical(
-        rows
-    )
-
-
-    with CACHE_LOCK:
-
-        TECH_CACHE[
-            timeframe
-        ] = {
-
-            "technical":
-                t,
-
-            "updated":
-                now
-
-        }
-
-
-    return TECH_CACHE[
-        timeframe
-    ]
-
-
-# ============================================================
-# INITIAL DASHBOARD
-# ============================================================
-
-@app.get(
-    "/api/dashboard"
-)
-def dashboard(
-
-    timeframe: str = Query(
-        "1H"
-    )
-
-):
-
-    if timeframe not in TIMEFRAMES:
-
-        timeframe = "1H"
-
-
-    # Parallel initial loading
-
-    with ThreadPoolExecutor(
-        max_workers=3
-    ) as executor:
-
-        price_future = (
-            executor.submit(
-                get_price
-            )
-        )
-
-        technical_future = (
-            executor.submit(
-                get_signal_data,
-                timeframe
-            )
-        )
-
-        news_future = (
-            executor.submit(
-                gdelt_news
-            )
-        )
-
-
-        market = (
-            price_future.result()
-        )
-
-
-        technical_data = (
-            technical_future.result()
-        )
-
-
-        news_data = (
-            news_future.result()
-        )
-
-
-    t = (
-        technical_data[
-            "technical"
-        ]
-    )
-
-
-    news_items = (
-        news_data["items"]
-    )
-
-
-    n = news_score(
-        news_items
-    )
-
-
-    signal = build_signal(
-        t,
-        n
-    )
-
-
-    return {
-
-        "server_time":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-
-        "timeframe":
-            timeframe,
-
-        "market":
-            market,
-
-        "technical":
-            t,
-
-        "news_bias":
-            n,
-
-        "news_status":
-            news_data["status"],
-
-        "news_updated":
-            news_data["updated"],
-
-        "signal":
-            signal,
-
-        "news":
-            news_items
-
-    }
-
-
-# ============================================================
-# FAST PRICE API
-# ============================================================
-
-@app.get(
-    "/api/live-price"
-)
+@app.get("/api/live-price")
 def live_price():
 
-    try:
-
-        market = get_price()
-
-
-        return {
-
-            "ok":
-                True,
-
-            "price":
-                market["price"],
-
-            "bid":
-                market["bid"],
-
-            "ask":
-                market["ask"],
-
-            "source":
-                market["source"],
-
-            "server_time":
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-
-        }
-
-
-    except Exception as e:
-
-        return {
-
-            "ok":
-                False,
-
-            "error":
-                str(e)
-
-        }
-
-
-# ============================================================
-# FAST SIGNAL API
-# ============================================================
-
-@app.get(
-    "/api/live-signal"
-)
-def live_signal(
-
-    timeframe: str = Query(
-        "1H"
+    return JSONResponse(
+        get_live_price()
     )
 
+
+@app.get("/api/candles")
+def candles(
+    timeframe: str = Query("1h")
 ):
 
-    if timeframe not in TIMEFRAMES:
+    allowed = {
+        "1min",
+        "5min",
+        "15min",
+        "30min",
+        "1h",
+        "4h",
+        "1day"
+    }
 
-        timeframe = "1H"
+    if timeframe not in allowed:
+        timeframe = "1h"
 
-
-    try:
-
-        technical_data = (
-            get_signal_data(
-                timeframe
-            )
+    return JSONResponse(
+        get_candles(
+            interval=timeframe,
+            outputsize=200
         )
+    )
 
 
-        news_data = (
-            gdelt_news()
-        )
+@app.get("/api/live-signal")
+def live_signal(
+    timeframe: str = Query("1h")
+):
+
+    allowed = {
+        "1min",
+        "5min",
+        "15min",
+        "30min",
+        "1h",
+        "4h",
+        "1day"
+    }
+
+    if timeframe not in allowed:
+        timeframe = "1h"
+
+    data = get_candles(
+        interval=timeframe,
+        outputsize=250
+    )
+
+    candles_data = data.get("values", [])
+
+    signal = generate_signal(
+        candles_data
+    )
+
+    signal["timeframe"] = timeframe
+
+    return JSONResponse(signal)
 
 
-        t = (
-            technical_data[
-                "technical"
-            ]
-        )
+@app.get("/api/news")
+def news():
+
+    return JSONResponse(
+        get_news()
+    )
 
 
-        n = news_score(
-            news_data["items"]
-        )
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "service": "Gold AI Live v5",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 
-        signal = build_signal(
-            t,
-            n
-        )
-
-
-        return {
-
-            "ok":
-                True,
-
-            "timeframe":
-                timeframe,
-
-            "technical":
-                t,
-
-            "news_bias":
-                n,
-
-            "news_status":
-                news_data[
-                    "status"
-                ],
-
-            "signal":
-                signal,
-
-            "server_time":
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-
-        }
-
-
-    except Exception as e:
-
-        return {
-
-            "ok":
-                False,
-
-            "error":
-                str(e)
-
-        }
-
-
-# ============================================================
-# HTML
-# ============================================================
+# =========================================================
+# FRONTEND
+# =========================================================
 
 HTML_PAGE = r"""
-<!doctype html>
-
+<!DOCTYPE html>
 <html>
-
 <head>
 
-<meta charset="utf-8">
-
 <meta name="viewport"
-content="width=device-width,initial-scale=1">
+content="width=device-width, initial-scale=1">
 
-<meta name="theme-color"
-content="#08111f">
-
-<link rel="manifest"
-href="/manifest.json">
-
-<title>Gold AI Live v4</title>
-
+<title>Gold AI Live v5</title>
 
 <style>
 
-*{
-box-sizing:border-box
+* {
+    box-sizing: border-box;
 }
 
-
-body{
-
-margin:0;
-
-background:#08111f;
-
-color:#f2f6ff;
-
-font-family:
-system-ui,
--apple-system,
-BlinkMacSystemFont,
-"Segoe UI",
-sans-serif
-
+body {
+    margin: 0;
+    background: #07111f;
+    color: white;
+    font-family: Arial, sans-serif;
 }
 
-
-main{
-
-max-width:950px;
-
-margin:auto;
-
-padding:16px
-
+.header {
+    padding: 22px;
+    background: #0b1729;
+    border-bottom: 1px solid #23334a;
 }
 
-
-.top{
-
-display:flex;
-
-justify-content:
-space-between;
-
-align-items:center;
-
-gap:10px
-
+.title {
+    font-size: 27px;
+    font-weight: bold;
 }
 
-
-h1{
-
-margin:5px 0;
-
-font-size:25px
-
+.subtitle {
+    margin-top: 6px;
+    color: #8fa4bf;
 }
 
-
-.muted{
-
-color:#91a0b7;
-
-font-size:13px
-
+.container {
+    padding: 15px;
+    max-width: 1200px;
+    margin: auto;
 }
 
-
-.price{
-
-font-size:42px;
-
-font-weight:850;
-
-margin-top:10px
-
+.timeframes {
+    display: grid;
+    grid-template-columns:
+    repeat(7, 1fr);
+    gap: 8px;
+    margin-bottom: 15px;
 }
 
-
-.card{
-
-background:#101b2d;
-
-border:
-1px solid #243552;
-
-border-radius:18px;
-
-padding:16px;
-
-margin-top:12px
-
+button {
+    border: 0;
+    border-radius: 10px;
+    padding: 13px 5px;
+    background: #172942;
+    color: white;
+    font-weight: bold;
 }
 
-
-.tf{
-
-display:grid;
-
-grid-template-columns:
-repeat(7,1fr);
-
-gap:6px;
-
-margin-top:14px
-
+button.active {
+    background: #1769ff;
 }
 
-
-button{
-
-background:#17243a;
-
-border:
-1px solid #30435f;
-
-color:#eaf0fb;
-
-border-radius:10px;
-
-padding:10px 4px;
-
-font-weight:750;
-
-cursor:pointer
-
+.card {
+    background: #0d1b2e;
+    border: 1px solid #243852;
+    border-radius: 15px;
+    padding: 18px;
+    margin-bottom: 15px;
 }
 
-
-button.active{
-
-background:#2187ff
-
+.price {
+    font-size: 38px;
+    font-weight: bold;
 }
 
-
-button:disabled{
-
-opacity:.6
-
+.status {
+    color: #61e6a1;
+    margin-left: 8px;
 }
 
-
-.signal{
-
-font-size:34px;
-
-font-weight:900;
-
-margin-top:8px
-
+.signal {
+    font-size: 34px;
+    font-weight: bold;
+    margin-bottom: 12px;
 }
 
-
-.buy{
-
-color:#4ee0ad
-
+.grid {
+    display: grid;
+    grid-template-columns:
+    repeat(2, 1fr);
+    gap: 15px;
 }
 
-
-.sell{
-
-color:#ff7188
-
+.row {
+    display: flex;
+    justify-content: space-between;
+    padding: 9px 0;
+    border-bottom: 1px solid #20324b;
 }
 
-
-.wait{
-
-color:#ffd166
-
+.label {
+    color: #8fa4bf;
 }
 
-
-.strong{
-
-font-size:39px
-
+.buy {
+    color: #45e59a;
 }
 
-
-.grid{
-
-display:grid;
-
-grid-template-columns:
-1fr 1fr;
-
-gap:12px
-
+.sell {
+    color: #ff647c;
 }
 
-
-.row{
-
-display:flex;
-
-justify-content:
-space-between;
-
-padding:8px 0;
-
-border-bottom:
-1px solid #1f2b40
-
+.wait {
+    color: #ffc857;
 }
 
-
-.news{
-
-padding:11px 0;
-
-border-bottom:
-1px solid #202e44
-
+.news {
+    margin-top: 10px;
 }
 
-
-.news a{
-
-color:#dbe8ff;
-
-text-decoration:none;
-
-font-weight:600;
-
-line-height:1.35
-
+.news-item {
+    padding: 12px 0;
+    border-bottom: 1px solid #20324b;
 }
 
-
-.badge{
-
-display:inline-block;
-
-border-radius:20px;
-
-padding:5px 9px;
-
-font-size:12px;
-
-font-weight:800;
-
-background:#26354d
-
+.small {
+    color: #8095ae;
+    font-size: 12px;
 }
 
+@media(max-width:700px) {
 
-.live{
+    .timeframes {
+        grid-template-columns:
+        repeat(4, 1fr);
+    }
 
-color:#4ee0ad
-
-}
-
-
-.cache{
-
-color:#ffd166
-
-}
-
-
-.error{
-
-color:#ff7188
-
-}
-
-
-.levels{
-
-display:grid;
-
-grid-template-columns:
-repeat(3,1fr);
-
-gap:8px;
-
-margin-top:10px
-
-}
-
-
-.level{
-
-background:#0b1525;
-
-border:
-1px solid #23344f;
-
-border-radius:12px;
-
-padding:10px
-
-}
-
-
-.metric{
-
-font-size:18px;
-
-font-weight:800
-
-}
-
-
-#lastSignal{
-
-margin-top:8px
-
-}
-
-
-@media(max-width:650px){
-
-.tf{
-
-grid-template-columns:
-repeat(4,1fr)
-
-}
-
-
-.grid{
-
-grid-template-columns:
-1fr
-
-}
-
-
-.price{
-
-font-size:34px
-
-}
-
-
-.signal{
-
-font-size:30px
-
-}
-
-
-.strong{
-
-font-size:34px
-
-}
-
-
-.levels{
-
-grid-template-columns:
-1fr
-
-}
+    .grid {
+        grid-template-columns: 1fr;
+    }
 
 }
 
@@ -2233,1460 +857,486 @@ grid-template-columns:
 
 </head>
 
-
 <body>
 
-<main>
+<div class="header">
 
+    <div class="title">
+        🥇 Gold AI Live v5
+    </div>
 
-<div class="top">
-
-<div>
-
-<h1>
-🥇 Gold AI Live v4
-</h1>
-
-<div class="muted">
-
-XAUUSD • Fast Live AI
-Technical + Global News
+    <div class="subtitle">
+        XAU/USD • Live Price • AI Technical Signal • Global News
+    </div>
 
 </div>
 
-</div>
+<div class="container">
 
+    <div class="timeframes">
 
-<button
-onclick="fullRefresh()"
-id="refreshBtn">
+        <button onclick="changeTF('1min',this)">
+            1m
+        </button>
 
-Refresh
+        <button onclick="changeTF('5min',this)">
+            5m
+        </button>
 
-</button>
+        <button onclick="changeTF('15min',this)">
+            15m
+        </button>
 
-</div>
+        <button onclick="changeTF('30min',this)">
+            30m
+        </button>
 
+        <button class="active"
+        onclick="changeTF('1h',this)">
+            1H
+        </button>
 
-<div
-class="tf"
-id="tf">
-</div>
+        <button onclick="changeTF('4h',this)">
+            4H
+        </button>
 
+        <button onclick="changeTF('1day',this)">
+            1D
+        </button>
 
-<!-- PRICE -->
+    </div>
 
-<div class="card">
 
-<div class="muted">
+    <div class="card">
 
-XAUUSD
+        <div>
+            XAU/USD
+            <span class="status"
+            id="priceStatus">
+                LIVE
+            </span>
+        </div>
 
-<span
-class="badge live"
-id="status">
+        <div class="price"
+        id="price">
+            Loading...
+        </div>
 
-LIVE
+    </div>
 
-</span>
 
-</div>
+    <div class="grid">
 
+        <div class="card">
 
-<div
-class="price"
-id="price">
+            <div class="small">
+                AI CALL
+            </div>
 
-—
+            <div class="signal"
+            id="signal">
+                LOADING
+            </div>
 
-</div>
+            <div class="row">
+                <span class="label">
+                    BUY probability
+                </span>
 
+                <span id="buy">
+                    -
+                </span>
+            </div>
 
-<div
-class="muted"
-id="src">
+            <div class="row">
+                <span class="label">
+                    SELL probability
+                </span>
 
-—
+                <span id="sell">
+                    -
+                </span>
+            </div>
 
-</div>
+            <div class="row">
+                <span class="label">
+                    Confidence
+                </span>
 
-</div>
+                <span id="confidence">
+                    -
+                </span>
+            </div>
 
+        </div>
 
-<div class="grid">
 
-
-<!-- SIGNAL -->
-
-<div class="card">
-
-<div class="muted">
-
-AI CALL •
-<span id="tfl">
-1H
-</span>
-
-</div>
-
-
-<div
-id="sig"
-class="signal wait">
-
-LOADING
-
-</div>
-
-
-<div
-id="lastSignal"
-class="muted">
-
-—
-
-</div>
-
-
-<div class="row">
-
-<span>
-BUY probability
-</span>
-
-<b id="buy">
-—
-</b>
-
-</div>
-
-
-<div class="row">
-
-<span>
-SELL probability
-</span>
-
-<b id="sell">
-—
-</b>
-
-</div>
-
-
-<div class="row">
-
-<span>
-Confidence
-</span>
-
-<b id="conf">
-—
-</b>
-
-</div>
-
-
-<div class="levels">
-
-
-<div class="level">
-
-<div class="muted">
-ENTRY
-</div>
-
-<div
-class="metric"
-id="entry">
-
-—
-
-</div>
-
-</div>
-
-
-<div class="level">
-
-<div class="muted">
-STOP LOSS
-</div>
-
-<div
-class="metric"
-id="sl">
-
-—
-
-</div>
-
-</div>
-
-
-<div class="level">
-
-<div class="muted">
-TP1 / TP2
-</div>
-
-<div
-class="metric"
-id="tp">
-
-—
-
-</div>
-
-</div>
-
+        <div class="card">
+
+            <div class="small">
+                TECHNICAL DATA
+            </div>
+
+            <div class="row">
+                <span class="label">
+                    EMA20
+                </span>
+
+                <span id="ema20">
+                    -
+                </span>
+            </div>
+
+            <div class="row">
+                <span class="label">
+                    EMA50
+                </span>
+
+                <span id="ema50">
+                    -
+                </span>
+            </div>
+
+            <div class="row">
+                <span class="label">
+                    EMA200
+                </span>
+
+                <span id="ema200">
+                    -
+                </span>
+            </div>
+
+            <div class="row">
+                <span class="label">
+                    RSI
+                </span>
+
+                <span id="rsi">
+                    -
+                </span>
+            </div>
+
+            <div class="row">
+                <span class="label">
+                    MACD
+                </span>
+
+                <span id="macd">
+                    -
+                </span>
+            </div>
+
+            <div class="row">
+                <span class="label">
+                    ATR
+                </span>
+
+                <span id="atr">
+                    -
+                </span>
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="small">
+            GLOBAL GOLD NEWS
+        </div>
+
+        <div class="news"
+        id="news">
+            Loading news...
+        </div>
+
+    </div>
 
 </div>
-
-
-<p
-class="muted"
-id="rr">
-
-Risk/Reward: —
-
-</p>
-
-
-<p
-class="muted"
-id="reason">
-
-—
-
-</p>
-
-</div>
-
-
-<!-- TECHNICAL -->
-
-<div class="card">
-
-<div class="muted">
-
-TECHNICAL DATA
-
-</div>
-
-
-<div class="row">
-
-<span>
-EMA20
-</span>
-
-<b id="e20">
-—
-</b>
-
-</div>
-
-
-<div class="row">
-
-<span>
-EMA50
-</span>
-
-<b id="e50">
-—
-</b>
-
-</div>
-
-
-<div class="row">
-
-<span>
-EMA200
-</span>
-
-<b id="e200">
-—
-</b>
-
-</div>
-
-
-<div class="row">
-
-<span>
-RSI
-</span>
-
-<b id="rsi">
-—
-</b>
-
-</div>
-
-
-<div class="row">
-
-<span>
-MACD Histogram
-</span>
-
-<b id="macd">
-—
-</b>
-
-</div>
-
-
-<div class="row">
-
-<span>
-ATR
-</span>
-
-<b id="atr">
-—
-</b>
-
-</div>
-
-</div>
-
-</div>
-
-
-<!-- NEWS -->
-
-<div class="card">
-
-<div class="muted">
-
-GLOBAL GOLD NEWS
-
-<span
-class="badge"
-id="newsStatus">
-
-—
-
-</span>
-
-</div>
-
-
-<p>
-
-<span
-class="badge"
-id="nb">
-
-NEUTRAL
-
-</span>
-
-
-<span
-class="muted"
-id="ns">
-
-Score 50
-
-</span>
-
-</p>
-
-
-<div
-id="news">
-
-Loading news…
-
-</div>
-
-
-<div
-class="muted"
-id="newsUpdated">
-
-—
-
-</div>
-
-</div>
-
-
-<!-- RISK -->
-
-<div class="card">
-
-<b>
-⚠️ Risk notice
-</b>
-
-
-<p class="muted">
-
-This system gives
-probabilistic market
-signals. BUY/SELL or
-STRONG BUY/STRONG SELL
-is not a guaranteed
-prediction.
-
-</p>
-
-
-<p class="muted">
-
-Always verify market
-conditions and use
-appropriate risk
-management.
-
-</p>
-
-</div>
-
-
-<div
-class="muted"
-id="updated">
-
-—
-
-</div>
-
-
-</main>
 
 
 <script>
 
-
-const T = [
-
-"1m",
-"5m",
-"15m",
-"30m",
-"1H",
-"4H",
-"1D"
-
-];
+let timeframe = "1h";
 
 
-let tf = "1H";
+function number(value, digits=2) {
+
+    if (value === null ||
+        value === undefined) {
+
+        return "-";
+    }
+
+    return Number(value)
+        .toFixed(digits);
+}
 
 
-const box =
-document.getElementById(
-"tf"
-);
+function changeTF(tf, button) {
+
+    timeframe = tf;
+
+    document
+        .querySelectorAll(".timeframes button")
+        .forEach(
+            b => b.classList.remove("active")
+        );
+
+    button.classList.add("active");
+
+    loadAll();
+}
 
 
-T.forEach(
-function(x){
+async function loadPrice() {
 
-const b =
-document.createElement(
-"button"
-);
+    try {
 
+        const response =
+            await fetch(
+                "/api/live-price"
+            );
 
-b.textContent = x;
+        const data =
+            await response.json();
 
+        if (data.price !== null &&
+            data.price !== undefined) {
 
-b.onclick =
-function(){
+            document
+                .getElementById("price")
+                .innerText =
+                number(data.price, 2);
 
-tf = x;
+            document
+                .getElementById("priceStatus")
+                .innerText = "LIVE";
 
-paint();
+        }
 
-fullRefresh();
+    } catch(e) {
 
-};
-
-
-b.id =
-"x" + x;
-
-
-box.appendChild(b);
-
-});
-
-
-function paint(){
-
-T.forEach(
-function(x){
-
-document
-.getElementById(
-"x" + x
-)
-.classList
-.toggle(
-"active",
-x === tf
-);
-
-});
+        document
+            .getElementById("priceStatus")
+            .innerText = "ERROR";
+    }
 
 }
 
 
-function fmt(v){
+async function loadSignal() {
 
-return v == null
+    try {
 
-? "—"
+        const response =
+            await fetch(
+                "/api/live-signal?timeframe="
+                + timeframe
+            );
 
-:
-
-Number(v)
-.toFixed(2);
-
-}
-
-
-function setSignal(
-s
-){
-
-const el =
-document.getElementById(
-"sig"
-);
+        const data =
+            await response.json();
 
 
-el.textContent =
-s.strength;
+        const signal =
+            document.getElementById("signal");
+
+        signal.innerText =
+            data.signal || "WAIT";
 
 
-if(
-s.strength ===
-"STRONG BUY"
-){
-
-el.className =
-"signal buy strong";
-
-}
-
-else if(
-s.strength ===
-"BUY"
-){
-
-el.className =
-"signal buy";
-
-}
-
-else if(
-s.strength ===
-"STRONG SELL"
-){
-
-el.className =
-"signal sell strong";
-
-}
-
-else if(
-s.strength ===
-"SELL"
-){
-
-el.className =
-"signal sell";
-
-}
-
-else{
-
-el.className =
-"signal wait";
-
-}
+        signal.className =
+            "signal " +
+            (
+                data.signal === "BUY"
+                ? "buy"
+                : data.signal === "SELL"
+                ? "sell"
+                : "wait"
+            );
 
 
-document
-.getElementById(
-"buy"
-)
-.textContent =
-s.buy + "%";
+        document
+            .getElementById("buy")
+            .innerText =
+            number(data.buy_probability, 1)
+            + "%";
 
 
-document
-.getElementById(
-"sell"
-)
-.textContent =
-s.sell + "%";
+        document
+            .getElementById("sell")
+            .innerText =
+            number(data.sell_probability, 1)
+            + "%";
 
 
-document
-.getElementById(
-"conf"
-)
-.textContent =
-s.confidence + "%";
+        document
+            .getElementById("confidence")
+            .innerText =
+            number(data.confidence, 1)
+            + "%";
 
 
-document
-.getElementById(
-"entry"
-)
-.textContent =
-fmt(s.entry);
+        document
+            .getElementById("ema20")
+            .innerText =
+            number(data.ema20);
 
 
-document
-.getElementById(
-"sl"
-)
-.textContent =
-fmt(s.stop_loss);
+        document
+            .getElementById("ema50")
+            .innerText =
+            number(data.ema50);
 
 
-document
-.getElementById(
-"tp"
-)
-.textContent =
-
-s.tp1 == null
-
-? "—"
-
-:
-
-fmt(s.tp1)
-+
-" / "
-+
-fmt(s.tp2);
+        document
+            .getElementById("ema200")
+            .innerText =
+            number(data.ema200);
 
 
-document
-.getElementById(
-"rr"
-)
-.textContent =
-
-"Risk/Reward: "
-+
-s.risk_reward;
+        document
+            .getElementById("rsi")
+            .innerText =
+            number(data.rsi, 1);
 
 
-document
-.getElementById(
-"reason"
-)
-.textContent =
-s.reason;
+        document
+            .getElementById("macd")
+            .innerText =
+            number(data.macd, 4);
 
 
-document
-.getElementById(
-"lastSignal"
-)
-.textContent =
+        document
+            .getElementById("atr")
+            .innerText =
+            number(data.atr, 3);
 
-"Signal updated: "
-+
-new Date()
-.toLocaleTimeString();
+
+    } catch(e) {
+
+        document
+            .getElementById("signal")
+            .innerText =
+            "ERROR";
+
+    }
 
 }
 
 
-function setTechnical(
-t
-){
+async function loadNews() {
 
-document
-.getElementById(
-"e20"
-)
-.textContent =
-fmt(t.ema20);
+    try {
 
+        const response =
+            await fetch("/api/news");
 
-document
-.getElementById(
-"e50"
-)
-.textContent =
-fmt(t.ema50);
+        const data =
+            await response.json();
 
+        const box =
+            document.getElementById("news");
 
-document
-.getElementById(
-"e200"
-)
-.textContent =
-fmt(t.ema200);
+        if (!data.articles ||
+            data.articles.length === 0) {
+
+            box.innerHTML =
+                "<div class='small'>"
+                + "News unavailable"
+                + "</div>";
+
+            return;
+        }
 
 
-document
-.getElementById(
-"rsi"
-)
-.textContent =
-Number(
-t.rsi
-)
-.toFixed(1);
+        box.innerHTML =
+            data.articles.map(
+                article => {
+
+                    const title =
+                        article.title ||
+                        "Gold market news";
+
+                    return `
+                        <div class="news-item">
+                            <div>
+                                ${title}
+                            </div>
+                            <div class="small">
+                                ${article.publishedAt || ""}
+                            </div>
+                        </div>
+                    `;
+
+                }
+            ).join("");
+
+    } catch(e) {
+
+        document
+            .getElementById("news")
+            .innerText =
+            "News unavailable";
+
+    }
+
+}
 
 
-document
-.getElementById(
-"macd"
-)
-.textContent =
-Number(
-t.macd_hist
-)
-.toFixed(3);
+function loadAll() {
 
-
-document
-.getElementById(
-"atr"
-)
-.textContent =
-fmt(t.atr);
+    loadPrice();
+    loadSignal();
+    loadNews();
 
 }
 
 
-function setNews(
-d
-){
+loadAll();
 
-const n =
-d.news_bias;
 
-
-document
-.getElementById(
-"nb"
-)
-.textContent =
-n.bias;
-
-
-document
-.getElementById(
-"ns"
-)
-.textContent =
-
-"Score "
-+
-n.score;
-
-
-const status =
-document.getElementById(
-"newsStatus"
-);
-
-
-status.textContent =
-d.news_status;
-
-
-status.className =
-"badge " +
-
-(
-
-d.news_status ===
-"LIVE"
-
-? "live"
-
-:
-
-d.news_status ===
-"CACHE"
-
-? "cache"
-
-: "error"
-
-);
-
-
-const container =
-document.getElementById(
-"news"
-);
-
-
-container.innerHTML = "";
-
-
-if(
-!d.news ||
-!d.news.length
-){
-
-container.innerHTML =
-'<span class="muted">' +
-'No recent gold news available.' +
-'</span>';
-
-}
-
-else{
-
-d.news.forEach(
-function(a){
-
-const div =
-document.createElement(
-"div"
-);
-
-div.className =
-"news";
-
-
-const link =
-document.createElement(
-"a"
-);
-
-link.href =
-a.url || "#";
-
-link.target =
-"_blank";
-
-link.rel =
-"noopener noreferrer";
-
-link.textContent =
-a.title ||
-"Gold news";
-
-
-const meta =
-document.createElement(
-"div"
-);
-
-meta.className =
-"muted";
-
-
-meta.textContent =
-
-(
-a.source ||
-"Global source"
-)
-
-+
-
-" • "
-
-+
-
-(
-a.published ||
-"Recent"
-);
-
-
-div.appendChild(
-link
-);
-
-div.appendChild(
-meta
-);
-
-container.appendChild(
-div
-);
-
-});
-
-}
-
-
-if(
-d.news_updated
-){
-
-document
-.getElementById(
-"newsUpdated"
-)
-.textContent =
-
-"News updated: "
-
-+
-
-new Date(
-d.news_updated * 1000
-)
-.toLocaleString();
-
-}
-
-}
-
-
-function setPrice(
-d
-){
-
-if(
-!d ||
-!d.ok
-){
-
-return;
-
-}
-
-
-document
-.getElementById(
-"price"
-)
-.textContent =
-fmt(d.price);
-
-
-document
-.getElementById(
-"status"
-)
-.textContent =
-"LIVE";
-
-
-document
-.getElementById(
-"src"
-)
-.textContent =
-d.source
-+
-" • "
-+
-tf;
-
-}
-
-
-async function fastPrice(){
-
-try{
-
-const r =
-await fetch(
-
-"/api/live-price",
-
-{
-cache:
-"no-store"
-}
-
-);
-
-
-const d =
-await r.json();
-
-
-if(d.ok){
-
-setPrice(d);
-
-}
-
-}
-
-catch(e){
-
-// Keep previous valid price
-
-}
-
-}
-
-
-async function fastSignal(){
-
-try{
-
-const r =
-await fetch(
-
-"/api/live-signal?timeframe="
-+
-encodeURIComponent(tf),
-
-{
-cache:
-"no-store"
-}
-
-);
-
-
-const d =
-await r.json();
-
-
-if(
-!r.ok ||
-!d.ok
-){
-
-return;
-
-}
-
-
-setSignal(
-d.signal
-);
-
-
-setTechnical(
-d.technical
-);
-
-
-const newsData = {
-
-news_bias:
-d.news_bias,
-
-news_status:
-d.news_status,
-
-news_updated:
-0,
-
-news: []
-
-};
-
-
-document
-.getElementById(
-"nb"
-)
-.textContent =
-d.news_bias.bias;
-
-
-document
-.getElementById(
-"ns"
-)
-.textContent =
-
-"Score "
-+
-d.news_bias.score;
-
-
-document
-.getElementById(
-"lastSignal"
-)
-.textContent =
-
-"Signal updated: "
-+
-new Date()
-.toLocaleTimeString();
-
-}
-
-catch(e){
-
-// Keep previous valid signal
-
-}
-
-}
-
-
-async function fullRefresh(){
-
-const refresh =
-document.getElementById(
-"refreshBtn"
-);
-
-
-try{
-
-refresh.disabled =
-true;
-
-
-document
-.getElementById(
-"status"
-)
-.textContent =
-"LOADING";
-
-
-const r =
-await fetch(
-
-"/api/dashboard?timeframe="
-+
-encodeURIComponent(tf),
-
-{
-cache:
-"no-store"
-}
-
-);
-
-
-const d =
-await r.json();
-
-
-if(
-!r.ok ||
-d.detail
-){
-
-throw new Error(
-d.detail ||
-"API error"
-);
-
-}
-
-
-setPrice({
-
-ok:
-true,
-
-price:
-d.market.price,
-
-bid:
-d.market.bid,
-
-ask:
-d.market.ask,
-
-source:
-d.market.source
-
-});
-
-
-setSignal(
-d.signal
-);
-
-
-setTechnical(
-d.technical
-);
-
-
-setNews(
-d
-);
-
-
-document
-.getElementById(
-"tfl"
-)
-.textContent =
-tf;
-
-
-document
-.getElementById(
-"updated"
-)
-.textContent =
-
-"Dashboard updated: "
-
-+
-
-new Date(
-d.server_time
-)
-.toLocaleString();
-
-
-}
-
-catch(e){
-
-document
-.getElementById(
-"status"
-)
-.textContent =
-"ERROR";
-
-
-document
-.getElementById(
-"updated"
-)
-.textContent =
-
-"Error: "
-+
-e.message;
-
-}
-
-finally{
-
-refresh.disabled =
-false;
-
-}
-
-}
-
-
-paint();
-
-fullRefresh();
-
-
-/*
-============================================================
-FAST AUTO REFRESH
-============================================================
-*/
-
-
-// Price every 3 seconds
+// IMPORTANT:
+// Do NOT request Twelve Data every second.
+// Backend cache handles the API.
+// Browser refreshes display only every 15 seconds.
 
 setInterval(
-
-fastPrice,
-
-3000
-
+    loadPrice,
+    15000
 );
-
-
-// Signal / technical every 10 seconds
 
 setInterval(
-
-fastSignal,
-
-10000
-
+    loadSignal,
+    60000
 );
-
-
-// Full dashboard + news every 60 seconds
 
 setInterval(
-
-fullRefresh,
-
-60000
-
+    loadNews,
+    300000
 );
-
-
-if(
-"serviceWorker"
-in navigator
-){
-
-navigator
-.serviceWorker
-.register(
-"/sw.js"
-)
-.catch(
-function(){}
-);
-
-}
 
 </script>
 
-
 </body>
-
 </html>
 """
 
 
-# ============================================================
-# PWA MANIFEST
-# ============================================================
+# =========================================================
+# STARTUP
+# =========================================================
 
-MANIFEST = '''
-{
-"name":"Gold AI Live v4",
-"short_name":"GoldAI",
-"start_url":"/",
-"display":"standalone",
-"background_color":"#08111f",
-"theme_color":"#08111f"
-}
-'''
+@app.on_event("startup")
+def startup_event():
 
-
-# ============================================================
-# SERVICE WORKER
-# ============================================================
-
-SW_JS = '''
-const CACHE="gold-ai-v4";
-
-self.addEventListener(
-"install",
-event => {
-
-event.waitUntil(
-
-caches.open(CACHE)
-.then(
-cache =>
-
-cache.addAll([
-"/",
-"/manifest.json"
-])
-
-)
-
-);
-
-});
-
-
-self.addEventListener(
-"activate",
-event => {
-
-event.waitUntil(
-self.clients.claim()
-);
-
-});
-
-
-self.addEventListener(
-"fetch",
-event => {
-
-if(
-event.request.url.includes(
-"/api/"
-)
-){
-
-return;
-
-}
-
-
-event.respondWith(
-
-fetch(
-event.request
-)
-
-.catch(
-
-() =>
-caches.match(
-event.request
-)
-
-)
-
-);
-
-});
-'''
-
-
-# ============================================================
-# HOME
-# ============================================================
-
-@app.get(
-"/",
-response_class=HTMLResponse
-)
-def home():
-
-    return HTML_PAGE
-
-
-# ============================================================
-# MANIFEST
-# ============================================================
-
-@app.get(
-"/manifest.json"
-)
-def manifest():
-
-    return Response(
-
-        MANIFEST,
-
-        media_type=
-        "application/manifest+json"
-
-    )
-
-
-# ============================================================
-# SERVICE WORKER
-# ============================================================
-
-@app.get(
-"/sw.js"
-)
-def service_worker():
-
-    return Response(
-
-        SW_JS,
-
-        media_type=
-        "application/javascript"
-
-    )
+    print("====================================")
+    print(" GOLD AI LIVE v5 STARTED")
+    print(" Twelve Data cache: 15 sec")
+    print(" Candle cache: 60 sec")
+    print(" News cache: 5 min")
+    print("====================================")
