@@ -546,17 +546,46 @@ def get_news():
                 description = (a.get("description") or "").lower()
                 text = title + " " + description
 
-                gold_score = sum(
-                    1 for word in gold_words if word in text
-                )
+                tokens = {
+    word.strip(".,:;!?()[]{}\"'")
+    for word in text.split()
+}
 
-                macro_score = sum(
-                    1 for word in macro_words if word in text
-                )
+def term_match(term):
+    if " " in term:
+        return term in text
+    return term in tokens
 
-                irrelevant_score = sum(
-                    1 for word in irrelevant_words if word in text
-                )
+gold_score = sum(
+    1 for word in gold_words if term_match(word)
+)
+
+macro_score = sum(
+    1 for word in macro_words if term_match(word)
+)
+
+irrelevant_score = sum(
+    1 for word in irrelevant_words if term_match(word)
+)
+
+strong_gold = any(
+    term_match(word)
+    for word in [
+        "xau",
+        "gold price",
+        "gold futures",
+        "spot gold",
+        "gold bullion",
+        "gold market",
+        "gold rises",
+        "gold falls",
+        "gold climbs",
+        "gold drops"
+    ]
+)
+
+if not strong_gold and macro_score < 2:
+    continue
 
                 # Keep only financially relevant news
                 if irrelevant_score > 0:
