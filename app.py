@@ -477,49 +477,119 @@ def get_news():
             return news_cache["data"]
 
     if not NEWS_API_KEY:
-        data = {"status": "unavailable", "articles": [], "message": "NEWS_API_KEY not configured"}
+        data = {
+            "status": "unavailable",
+            "articles": [],
+            "message": "NEWS_API_KEY not configured"
+        }
         return data
 
     try:
+        # Focused gold + macroeconomic news search
+        query = (
+            'gold OR XAU OR "gold price" OR "gold futures" OR bullion '
+            'OR "Federal Reserve" OR Fed OR "interest rates" '
+            'OR inflation OR CPI OR "US dollar" OR USD '
+            'OR "Treasury yields" OR "central bank" '
+            'OR tariff OR geopolitical'
+        )
+
         r = session.get(
             "https://newsapi.org/v2/everything",
             params={
-                "q": "gold OR XAU OR precious metals",
+                "q": query,
                 "language": "en",
                 "sortBy": "publishedAt",
-                "pageSize": 10,
+                "pageSize": 50,
                 "apiKey": NEWS_API_KEY
             },
             timeout=10
         )
+
         payload = r.json()
 
         if r.status_code >= 400 or payload.get("status") != "ok":
             data = {
                 "status": "error",
                 "articles": [],
-                "message": payload.get("message", f"HTTP_{r.status_code}")
+                "message": payload.get(
+                    "message",
+                    f"HTTP_{r.status_code}"
+                )
             }
+
         else:
-            data = {
-                "status": "ok",
-                "articles": [
-                    {
+            gold_words = [
+                "gold", "xau", "bullion", "precious metal",
+                "gold price", "gold futures"
+            ]
+
+            macro_words = [
+                "fed", "federal reserve", "interest rate",
+                "inflation", "cpi", "usd", "us dollar",
+                "treasury yield", "bond yield", "central bank",
+                "rbi", "ecb", "boj", "tariff",
+                "geopolitical", "war", "sanction",
+                "safe haven", "oil", "crude"
+            ]
+
+            irrelevant_words = [
+                "crab", "goldfish", "tap water", "appliances",
+                "mental health", "nutrition", "social media",
+                "celebrity", "medical bills", "farming"
+            ]
+
+            filtered = []
+
+            for a in payload.get("articles", []):
+                title = (a.get("title") or "").lower()
+                description = (a.get("description") or "").lower()
+                text = title + " " + description
+
+                gold_score = sum(
+                    1 for word in gold_words if word in text
+                )
+
+                macro_score = sum(
+                    1 for word in macro_words if word in text
+                )
+
+                irrelevant_score = sum(
+                    1 for word in irrelevant_words if word in text
+                )
+
+                # Keep only financially relevant news
+                if irrelevant_score > 0:
+                    continue
+
+                if gold_score >= 1 or macro_score >= 2:
+                    filtered.append({
                         "title": a.get("title"),
                         "url": a.get("url"),
                         "source": (a.get("source") or {}).get("name"),
                         "publishedAt": a.get("publishedAt")
-                    }
-                    for a in payload.get("articles", [])
-                ]
+                    })
+
+                if len(filtered) >= 10:
+                    break
+
+            data = {
+                "status": "ok",
+                "articles": filtered
             }
 
         with lock:
             news_cache["time"] = time.time()
             news_cache["data"] = data
+
         return data
+
     except Exception as e:
-        return {"status": "error", "articles": [], "message": type(e).__name__}
+        return {
+            "status": "error",
+            "articles": [],
+            "message": type(e).__name__
+        }
 
 
 @app.get("/health")
