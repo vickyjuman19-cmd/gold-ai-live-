@@ -20,7 +20,7 @@ YAHOO_SYMBOL = "GC=F"
 
 PRICE_CACHE_SECONDS = 15
 CANDLE_CACHE_SECONDS = 60
-NEWS_CACHE_SECONDS = 300
+NEWS_CACHE_SECONDS = 1800
 
 TIMEFRAME_MAP = {
     "1m": ("1m", "1d"),
@@ -477,21 +477,20 @@ def get_news():
             return news_cache["data"]
 
     if not NEWS_API_KEY:
-        data = {
+        return {
             "status": "unavailable",
             "articles": [],
             "message": "NEWS_API_KEY not configured"
         }
-        return data
 
     try:
-        # Focused gold + macroeconomic news search
         query = (
-            'gold OR XAU OR "gold price" OR "gold futures" OR bullion '
-            'OR "Federal Reserve" OR Fed OR "interest rates" '
-            'OR inflation OR CPI OR "US dollar" OR USD '
-            'OR "Treasury yields" OR "central bank" '
-            'OR tariff OR geopolitical'
+            '"gold price" OR gold OR XAU OR bullion OR "gold futures" '
+            'OR "precious metals" OR "Federal Reserve" OR Fed '
+            'OR "interest rate" OR inflation OR CPI OR "US dollar" '
+            'OR USD OR "Treasury yields" OR "central bank" '
+            'OR RBI OR ECB OR BOJ OR tariff OR sanctions '
+            'OR "safe haven" OR geopolitics'
         )
 
         r = session.get(
@@ -505,114 +504,100 @@ def get_news():
             },
             timeout=10
         )
-
         payload = r.json()
 
         if r.status_code >= 400 or payload.get("status") != "ok":
             data = {
                 "status": "error",
                 "articles": [],
-                "message": payload.get(
-                    "message",
-                    f"HTTP_{r.status_code}"
-                )
+                "message": payload.get("message", f"HTTP_{r.status_code}")
             }
-
         else:
-            gold_words = [
+            gold_terms = [
                 "gold", "xau", "bullion", "precious metal",
                 "gold price", "gold futures"
             ]
 
-            macro_words = [
-                "fed", "federal reserve", "interest rate",
-                "inflation", "cpi", "usd", "us dollar",
+            macro_terms = [
+                "federal reserve", "fed", "interest rate",
+                "inflation", "cpi", "us dollar", "usd",
                 "treasury yield", "bond yield", "central bank",
-                "rbi", "ecb", "boj", "tariff",
-                "geopolitical", "war", "sanction",
-                "safe haven", "oil", "crude"
+                "rbi", "ecb", "boj", "tariff", "sanction",
+                "safe haven", "geopolit", "war", "oil", "crude"
             ]
 
-            irrelevant_words = [
-                "crab", "goldfish", "tap water", "appliances",
-                "mental health", "nutrition", "social media",
-                "celebrity", "medical bills", "farming"
+            blocked_terms = [
+                "crab", "goldfish", "tap water", "water conditioner",
+                "appliance", "mental health", "nutrition",
+                "social media star", "celebrity", "medical bills",
+                "farming", "recipe", "football", "cricket",
+                "movie", "music", "entertainment"
             ]
 
-            filtered = []
+            scored = []
+            seen = set()
 
-            for a in payload.get("articles", []):
-                title = (a.get("title") or "").lower()
-                description = (a.get("description") or "").lower()
-                text = title + " " + description
+            for article in payload.get("articles", []):
+                title = (article.get("title") or "").strip()
+                description = (article.get("description") or "").strip()
+                text_blob = f"{title} {description}".lower()
 
-                tokens = {
-    word.strip(".,:;!?()[]{}\"'").lower()
-    for word in text.split()
-}
-
-def term_match(term):
-    term = term.lower()
-
-    if " " in term:
-        return term in text.lower()
-
-    return term in tokens
-
-
-gold_score = sum(
-    1 for word in gold_words if term_match(word)
-)
-
-macro_score = sum(
-    1 for word in macro_words if term_match(word)
-)
-
-irrelevant_score = sum(
-    1 for word in irrelevant_words if term_match(word)
-)
-
-irrelevant_score = sum(
-    1 for word in irrelevant_words if term_match(word)
-)
-
-strong_gold = any(
-    term_match(word)
-    for word in [
-        "xau",
-        "gold price",
-        "gold futures",
-        "spot gold",
-        "gold bullion",
-        "gold market",
-        "gold rises",
-        "gold falls",
-        "gold climbs",
-        "gold drops"
-    ]
-)
-
-if not strong_gold and macro_score < 2:
-    continue
-
-                # Keep only financially relevant news
-                if irrelevant_score > 0:
+                if not title:
                     continue
 
-                if gold_score >= 1 or macro_score >= 2:
-                    filtered.append({
-                        "title": a.get("title"),
-                        "url": a.get("url"),
-                        "source": (a.get("source") or {}).get("name"),
-                        "publishedAt": a.get("publishedAt")
-                    })
+                if any(term in text_blob for term in blocked_terms):
+                    continue
 
-                if len(filtered) >= 10:
-                    break
+                title_lower = title.lower()
+
+                gold_score = sum(
+                    3 if term in title_lower else 1
+                    for term in gold_terms
+                    if term in text_blob
+                )
+
+                macro_score = sum(
+                    2 if term in title_lower else 1
+                    for term in macro_terms
+                    if term in text_blob
+                )
+
+                if gold_score == 0 and macro_score < 2:
+                    continue
+
+                url = article.get("url") or ""
+                key = url or title_lower
+
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                score = gold_score + macro_score
+
+                if any(term in title_lower for term in ["gold", "xau", "bullion"]):
+                    score += 4
+
+                if any(term in title_lower for term in [
+                    "fed", "federal reserve", "interest rate",
+                    "inflation", "cpi", "dollar", "treasury yield"
+                ]):
+                    score += 2
+
+                scored.append((
+                    score,
+                    {
+                        "title": title,
+                        "url": url,
+                        "source": (article.get("source") or {}).get("name"),
+                        "publishedAt": article.get("publishedAt")
+                    }
+                ))
+
+            scored.sort(key=lambda item: item[0], reverse=True)
 
             data = {
                 "status": "ok",
-                "articles": filtered
+                "articles": [item[1] for item in scored[:10]]
             }
 
         with lock:
@@ -627,7 +612,6 @@ if not strong_gold and macro_score < 2:
             "articles": [],
             "message": type(e).__name__
         }
-
 
 @app.get("/health")
 def health():
