@@ -547,14 +547,18 @@ def get_news():
                 text = title + " " + description
 
                 tokens = {
-    word.strip(".,:;!?()[]{}\"'")
+    word.strip(".,:;!?()[]{}\"'").lower()
     for word in text.split()
 }
 
 def term_match(term):
+    term = term.lower()
+
     if " " in term:
-        return term in text
+        return term in text.lower()
+
     return term in tokens
+
 
 gold_score = sum(
     1 for word in gold_words if term_match(word)
@@ -562,6 +566,10 @@ gold_score = sum(
 
 macro_score = sum(
     1 for word in macro_words if term_match(word)
+)
+
+irrelevant_score = sum(
+    1 for word in irrelevant_words if term_match(word)
 )
 
 irrelevant_score = sum(
