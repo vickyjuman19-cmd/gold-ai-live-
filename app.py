@@ -10,1333 +10,705 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Gold AI Live v5")
+app = FastAPI(title="Gold AI Live v6")
 
 PRICE_API_KEY = os.getenv("PRICE_API_KEY", "").strip()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
 
 SYMBOL = "XAU/USD"
-
-# =========================================================
-# CACHE / THROTTLING
-# =========================================================
-
-PRICE_CACHE = {
-    "data": None,
-    "time": 0.0,
-}
-
-CANDLE_CACHE = {}
-
-NEWS_CACHE = {
-    "data": None,
-    "time": 0.0,
-}
-
-CACHE_LOCK = threading.Lock()
+YAHOO_SYMBOL = "GC=F"
 
 PRICE_CACHE_SECONDS = 15
 CANDLE_CACHE_SECONDS = 60
 NEWS_CACHE_SECONDS = 300
 
-MIN_PRICE_REQUEST_GAP = 15
-MIN_CANDLE_REQUEST_GAP = 60
-
-LAST_PRICE_REQUEST = 0.0
-LAST_CANDLE_REQUEST = 0.0
-
-
-# =========================================================
-# HTTP SESSION
-# =========================================================
+TIMEFRAME_MAP = {
+    "1m": ("1m", "1d"),
+    "5m": ("5m", "5d"),
+    "15m": ("15m", "1mo"),
+    "30m": ("30m", "1mo"),
+    "1h": ("1h", "3mo"),
+    "4h": ("1h", "6mo"),
+    "1d": ("1d", "2y"),
+}
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Gold-AI-Live/5.0"
+    "User-Agent": "Mozilla/5.0 GoldAI-Live/6.0"
 })
 
+lock = threading.Lock()
+price_cache = {"time": 0.0, "data": None}
+candle_cache = {}
+news_cache = {"time": 0.0, "data": None}
 
-# =========================================================
-# SAFE REQUEST
-# =========================================================
 
-def safe_get(url, params=None, timeout=12):
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def cache_fresh(item, seconds):
+    return item.get("data") is not None and (time.time() - item.get("time", 0)) < seconds
+
+
+def td_get(endpoint, params):
+    if not PRICE_API_KEY:
+        return None, "NO_PRICE_API_KEY"
+
+    p = dict(params)
+    p["apikey"] = PRICE_API_KEY
+
     try:
-        response = session.get(
-            url,
-            params=params,
-            timeout=timeout
+        r = session.get(
+            "https://api.twelvedata.com/" + endpoint,
+            params=p,
+            timeout=8
         )
+        if r.status_code == 429:
+            return None, "RATE_LIMIT"
+        if r.status_code >= 400:
+            return None, f"HTTP_{r.status_code}"
 
-        if response.status_code == 429:
-            return {
-                "ok": False,
-                "error": "RATE_LIMIT",
-                "status": 429
-            }
+        data = r.json()
+        if isinstance(data, dict) and data.get("status") == "error":
+            return None, str(data.get("code") or data.get("message") or "TD_ERROR")
 
-        if response.status_code != 200:
-            return {
-                "ok": False,
-                "error": f"HTTP_{response.status_code}",
-                "status": response.status_code
-            }
-
-        return {
-            "ok": True,
-            "data": response.json()
-        }
-
+        return data, None
     except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
+        return None, type(e).__name__
 
 
-# =========================================================
-# PRICE
-# =========================================================
-
-def get_live_price():
-
-    global LAST_PRICE_REQUEST
-
-    now = time.time()
-
-    with CACHE_LOCK:
-        if (
-            PRICE_CACHE["data"] is not None
-            and now - PRICE_CACHE["time"] < PRICE_CACHE_SECONDS
-        ):
-            return PRICE_CACHE["data"]
-
-        # Prevent multiple simultaneous API calls
-        if now - LAST_PRICE_REQUEST < MIN_PRICE_REQUEST_GAP:
-            if PRICE_CACHE["data"] is not None:
-                return PRICE_CACHE["data"]
-
-            return {
-                "symbol": SYMBOL,
-                "price": None,
-                "status": "waiting"
-            }
-
-        LAST_PRICE_REQUEST = now
-
-    if not PRICE_API_KEY:
-        return {
-            "symbol": SYMBOL,
-            "price": None,
-            "status": "missing_api_key"
-        }
-
-    url = "https://api.twelvedata.com/price"
-
-    result = safe_get(
-        url,
-        params={
-            "symbol": SYMBOL,
-            "apikey": PRICE_API_KEY
-        }
-    )
-
-    if not result["ok"]:
-
-        if result.get("error") == "RATE_LIMIT":
-            with CACHE_LOCK:
-                if PRICE_CACHE["data"] is not None:
-                    return PRICE_CACHE["data"]
-
-        return {
-            "symbol": SYMBOL,
-            "price": None,
-            "status": "error",
-            "error": result.get("error")
-        }
-
-    data = result["data"]
-
+def yahoo_chart(symbol, interval, range_):
     try:
-        price = float(data.get("price"))
-    except Exception:
-        price = None
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        r = session.get(
+            url,
+            params={
+                "interval": interval,
+                "range": range_,
+                "includePrePost": "true",
+                "events": "div,splits"
+            },
+            timeout=10
+        )
+        if r.status_code >= 400:
+            return None, f"YAHOO_HTTP_{r.status_code}"
 
-    output = {
-        "symbol": SYMBOL,
-        "price": price,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "status": "ok"
-    }
+        data = r.json()
+        result = data.get("chart", {}).get("result")
+        if not result:
+            err = data.get("chart", {}).get("error")
+            return None, str(err) if err else "YAHOO_NO_DATA"
 
-    with CACHE_LOCK:
-        PRICE_CACHE["data"] = output
-        PRICE_CACHE["time"] = time.time()
-
-    return output
+        return result[0], None
+    except Exception as e:
+        return None, f"YAHOO_{type(e).__name__}"
 
 
-# =========================================================
-# CANDLES
-# =========================================================
+def yahoo_candles(interval, range_):
+    data, err = yahoo_chart(YAHOO_SYMBOL, interval, range_)
+    if not data:
+        return [], err
 
-def get_candles(interval="1h", outputsize=200):
+    timestamps = data.get("timestamp") or []
+    q = (data.get("indicators", {}).get("quote") or [{}])[0]
 
-    global LAST_CANDLE_REQUEST
+    opens = q.get("open") or []
+    highs = q.get("high") or []
+    lows = q.get("low") or []
+    closes = q.get("close") or []
+    volumes = q.get("volume") or []
 
-    now = time.time()
-
-    cache_key = f"{interval}_{outputsize}"
-
-    with CACHE_LOCK:
-
-        cached = CANDLE_CACHE.get(cache_key)
-
-        if cached:
-            if now - cached["time"] < CANDLE_CACHE_SECONDS:
-                return cached["data"]
-
-        if now - LAST_CANDLE_REQUEST < MIN_CANDLE_REQUEST_GAP:
-
-            if cached:
-                return cached["data"]
-
-            return {
-                "status": "waiting",
-                "values": []
-            }
-
-        LAST_CANDLE_REQUEST = now
-
-    if not PRICE_API_KEY:
-        return {
-            "status": "missing_api_key",
-            "values": []
-        }
-
-    url = "https://api.twelvedata.com/time_series"
-
-    result = safe_get(
-        url,
-        params={
-            "symbol": SYMBOL,
-            "interval": interval,
-            "outputsize": outputsize,
-            "apikey": PRICE_API_KEY,
-            "format": "JSON"
-        },
-        timeout=15
-    )
-
-    if not result["ok"]:
-
-        if result.get("error") == "RATE_LIMIT":
-
-            with CACHE_LOCK:
-                cached = CANDLE_CACHE.get(cache_key)
-
-            if cached:
-                return cached["data"]
-
-        return {
-            "status": "error",
-            "values": [],
-            "error": result.get("error")
-        }
-
-    raw = result["data"]
-
-    values = raw.get("values", [])
-
-    if not values:
-        return {
-            "status": "error",
-            "values": [],
-            "error": raw.get("message", "No candle data")
-        }
-
-    candles = []
-
-    for item in reversed(values):
-
+    rows = []
+    for i, ts in enumerate(timestamps):
         try:
-
-            candles.append({
-                "datetime": item.get("datetime"),
-                "open": float(item["open"]),
-                "high": float(item["high"]),
-                "low": float(item["low"]),
-                "close": float(item["close"]),
+            o = opens[i]
+            h = highs[i]
+            l = lows[i]
+            c = closes[i]
+            if None in (o, h, l, c):
+                continue
+            rows.append({
+                "datetime": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": int(volumes[i] or 0)
             })
-
-        except Exception:
+        except (IndexError, TypeError, ValueError, OverflowError):
             continue
 
-    output = {
-        "status": "ok",
-        "interval": interval,
-        "values": candles
+    return rows, None
+
+
+def get_price():
+    with lock:
+        if cache_fresh(price_cache, PRICE_CACHE_SECONDS):
+            return price_cache["data"]
+
+    # Primary: Twelve Data
+    td, err = td_get("price", {"symbol": SYMBOL})
+    if td:
+        raw = td.get("price")
+        try:
+            price = float(raw)
+            data = {
+                "symbol": SYMBOL,
+                "price": price,
+                "source": "Twelve Data",
+                "status": "live",
+                "updated": now_iso()
+            }
+            with lock:
+                price_cache["time"] = time.time()
+                price_cache["data"] = data
+            return data
+        except (TypeError, ValueError):
+            pass
+
+    # Backup: Yahoo Gold futures
+    yahoo, yerr = yahoo_chart(YAHOO_SYMBOL, "1m", "1d")
+    if yahoo:
+        meta = yahoo.get("meta", {})
+        price = meta.get("regularMarketPrice")
+        if price is None:
+            ts = yahoo.get("timestamp") or []
+            q = (yahoo.get("indicators", {}).get("quote") or [{}])[0]
+            closes = q.get("close") or []
+            if ts and closes:
+                for value in reversed(closes):
+                    if value is not None:
+                        price = value
+                        break
+
+        if price is not None:
+            data = {
+                "symbol": SYMBOL,
+                "price": float(price),
+                "source": "Yahoo Finance GC=F backup",
+                "status": "backup",
+                "updated": now_iso(),
+                "primary_error": err
+            }
+            with lock:
+                price_cache["time"] = time.time()
+                price_cache["data"] = data
+            return data
+
+    data = {
+        "symbol": SYMBOL,
+        "price": None,
+        "status": "waiting",
+        "source": None,
+        "primary_error": err,
+        "backup_error": yerr,
+        "updated": now_iso()
+    }
+    return data
+
+
+def get_candles(timeframe):
+    timeframe = timeframe if timeframe in TIMEFRAME_MAP else "1h"
+
+    with lock:
+        item = candle_cache.get(timeframe)
+        if item and cache_fresh(item, CANDLE_CACHE_SECONDS):
+            return item["data"]
+
+    interval, range_ = TIMEFRAME_MAP[timeframe]
+
+    # 4H is constructed from Yahoo 1H candles.
+    rows, err = yahoo_candles(interval, range_)
+
+    if timeframe == "4h" and rows:
+        grouped = []
+        bucket = None
+        current = None
+
+        for row in rows:
+            dt = datetime.fromisoformat(row["datetime"])
+            hour_bucket = dt.replace(
+                hour=(dt.hour // 4) * 4,
+                minute=0,
+                second=0,
+                microsecond=0
+            ).isoformat()
+
+            if bucket != hour_bucket:
+                if current:
+                    grouped.append(current)
+                bucket = hour_bucket
+                current = {
+                    "datetime": hour_bucket,
+                    "open": row["open"],
+                    "high": row["high"],
+                    "low": row["low"],
+                    "close": row["close"],
+                    "volume": row["volume"]
+                }
+            else:
+                current["high"] = max(current["high"], row["high"])
+                current["low"] = min(current["low"], row["low"])
+                current["close"] = row["close"]
+                current["volume"] += row["volume"]
+
+        if current:
+            grouped.append(current)
+        rows = grouped
+
+    # Primary Twelve Data fallback for candles if Yahoo failed.
+    if not rows:
+        td_interval = {
+            "1m": "1min",
+            "5m": "5min",
+            "15m": "15min",
+            "30m": "30min",
+            "1h": "1h",
+            "4h": "4h",
+            "1d": "1day",
+        }[timeframe]
+
+        td, td_err = td_get(
+            "time_series",
+            {
+                "symbol": SYMBOL,
+                "interval": td_interval,
+                "outputsize": 300
+            }
+        )
+
+        if td and td.get("values"):
+            rows = []
+            for v in reversed(td["values"]):
+                try:
+                    rows.append({
+                        "datetime": v.get("datetime"),
+                        "open": float(v["open"]),
+                        "high": float(v["high"]),
+                        "low": float(v["low"]),
+                        "close": float(v["close"]),
+                        "volume": float(v.get("volume") or 0)
+                    })
+                except (KeyError, TypeError, ValueError):
+                    pass
+            err = None
+
+    result = {
+        "symbol": SYMBOL,
+        "timeframe": timeframe,
+        "candles": rows,
+        "source": "Yahoo Finance GC=F backup" if rows and err else "Twelve Data",
+        "status": "ok" if rows else "error",
+        "error": None if rows else err,
+        "updated": now_iso()
     }
 
-    with CACHE_LOCK:
-        CANDLE_CACHE[cache_key] = {
-            "data": output,
-            "time": time.time()
-        }
-
-    return output
-
-
-# =========================================================
-# INDICATORS
-# =========================================================
-
-def sma(values, period):
-
-    if len(values) < period:
-        return None
-
-    return sum(values[-period:]) / period
-
-
-def ema(values, period):
-
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    result = sum(values[:period]) / period
-
-    for price in values[period:]:
-        result = (
-            (price - result) * multiplier
-        ) + result
+    with lock:
+        candle_cache[timeframe] = {"time": time.time(), "data": result}
 
     return result
 
 
-def calculate_rsi(values, period=14):
+def sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
 
-    if len(values) <= period:
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    result = sum(values[:period]) / period
+    for price in values[period:]:
+        result = (price - result) * multiplier + result
+    return result
+
+
+def rsi(values, period=14):
+    if len(values) < period + 1:
         return None
 
     gains = []
     losses = []
-
     for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-
-        if change >= 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
-
-        avg_gain = (
-            (avg_gain * (period - 1))
-            + gains[i]
-        ) / period
-
-        avg_loss = (
-            (avg_loss * (period - 1))
-            + losses[i]
-        ) / period
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
 
     if avg_loss == 0:
-        return 100
-
+        return 100.0
     rs = avg_gain / avg_loss
-
     return 100 - (100 / (1 + rs))
 
 
-def calculate_macd(values):
+def macd(values):
+    if len(values) < 35:
+        return None, None
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+    if fast is None or slow is None:
+        return None, None
+    line = fast - slow
 
-    e12 = ema(values, 12)
-    e26 = ema(values, 26)
+    macd_values = []
+    start = 26
+    for i in range(start, len(values) + 1):
+        f = ema(values[:i], 12)
+        s = ema(values[:i], 26)
+        if f is not None and s is not None:
+            macd_values.append(f - s)
 
-    if e12 is None or e26 is None:
+    signal = ema(macd_values, 9) if len(macd_values) >= 9 else None
+    return line, signal
+
+
+def atr(candles, period=14):
+    if len(candles) < period + 1:
         return None
 
-    macd = e12 - e26
-
-    return macd
-
-
-def calculate_atr(candles, period=14):
-
-    if len(candles) <= period:
-        return None
-
-    true_ranges = []
-
+    trs = []
     for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        pc = candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
 
-        current = candles[i]
-        previous = candles[i - 1]
-
-        tr = max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"])
-        )
-
-        true_ranges.append(tr)
-
-    return sum(true_ranges[-period:]) / period
+    return sum(trs[-period:]) / period if len(trs) >= period else None
 
 
-# =========================================================
-# SIGNAL ENGINE
-# =========================================================
-
-def generate_signal(candles):
-
+def build_signal(candle_data):
+    candles = candle_data.get("candles") or []
     if len(candles) < 50:
-
         return {
-            "signal": "WAIT",
-            "buy_probability": 0,
-            "sell_probability": 0,
-            "confidence": 0,
-            "reason": "Not enough market data"
+            "call": "WAIT",
+            "buy_probability": 0.0,
+            "sell_probability": 0.0,
+            "confidence": 0.0,
+            "reason": "Not enough candle data",
+            "technical": {}
         }
 
     closes = [x["close"] for x in candles]
+    last = closes[-1]
 
-    current = closes[-1]
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    e200 = ema(closes, 200)
+    rv = rsi(closes, 14)
+    ml, ms = macd(closes)
+    av = atr(candles, 14)
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
-
-    rsi = calculate_rsi(closes)
-    macd = calculate_macd(closes)
-    atr = calculate_atr(candles)
-
-    buy_score = 0
-    sell_score = 0
-
+    score = 0.0
     reasons = []
 
-    # EMA 20 / 50
-    if ema20 and ema50:
-
-        if ema20 > ema50:
-            buy_score += 20
-            reasons.append("EMA20 above EMA50")
-
-        elif ema20 < ema50:
-            sell_score += 20
-            reasons.append("EMA20 below EMA50")
-
-    # EMA 200
-    if ema200:
-
-        if current > ema200:
-            buy_score += 20
-            reasons.append("Price above EMA200")
-
+    if e20 is not None and e50 is not None:
+        if e20 > e50:
+            score += 1.0
+            reasons.append("EMA20 > EMA50")
         else:
-            sell_score += 20
+            score -= 1.0
+            reasons.append("EMA20 < EMA50")
+
+    if e200 is not None:
+        if last > e200:
+            score += 1.0
+            reasons.append("Price above EMA200")
+        else:
+            score -= 1.0
             reasons.append("Price below EMA200")
 
-    # RSI
-    if rsi is not None:
+    if rv is not None:
+        if rv > 55:
+            score += 0.7
+            reasons.append("RSI bullish")
+        elif rv < 45:
+            score -= 0.7
+            reasons.append("RSI bearish")
 
-        if rsi < 30:
-            buy_score += 20
-            reasons.append("RSI oversold")
-
-        elif rsi > 70:
-            sell_score += 20
-            reasons.append("RSI overbought")
-
-        elif rsi >= 50:
-            buy_score += 10
-
+    if ml is not None and ms is not None:
+        if ml > ms:
+            score += 0.8
+            reasons.append("MACD bullish")
         else:
-            sell_score += 10
+            score -= 0.8
+            reasons.append("MACD bearish")
 
-    # MACD
-    if macd is not None:
+    max_score = 3.5
+    buy = max(0.0, min(100.0, 50 + (score / max_score) * 50))
+    sell = 100 - buy
+    confidence = min(99.0, abs(buy - sell) + 35)
 
-        if macd > 0:
-            buy_score += 20
-            reasons.append("MACD positive")
-
-        else:
-            sell_score += 20
-            reasons.append("MACD negative")
-
-    # Momentum
-    if len(closes) >= 6:
-
-        if current > closes[-6]:
-            buy_score += 10
-
-        else:
-            sell_score += 10
-
-    total = buy_score + sell_score
-
-    if total <= 0:
-
-        buy_probability = 50
-        sell_probability = 50
-
+    if buy >= 62:
+        call = "BUY"
+    elif sell >= 62:
+        call = "SELL"
     else:
-
-        buy_probability = round(
-            (buy_score / total) * 100,
-            1
-        )
-
-        sell_probability = round(
-            (sell_score / total) * 100,
-            1
-        )
-
-    if buy_probability >= 60:
-
-        signal = "BUY"
-
-    elif sell_probability >= 60:
-
-        signal = "SELL"
-
-    else:
-
-        signal = "WAIT"
-
-    confidence = round(
-        max(buy_probability, sell_probability),
-        1
-    )
+        call = "WAIT"
 
     return {
-        "signal": signal,
-        "buy_probability": buy_probability,
-        "sell_probability": sell_probability,
-        "confidence": confidence,
-        "price": current,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi": rsi,
-        "macd": macd,
-        "atr": atr,
-        "reason": reasons
+        "call": call,
+        "buy_probability": round(buy, 1),
+        "sell_probability": round(sell, 1),
+        "confidence": round(confidence, 1),
+        "reason": ", ".join(reasons),
+        "technical": {
+            "EMA20": round(e20, 3) if e20 is not None else None,
+            "EMA50": round(e50, 3) if e50 is not None else None,
+            "EMA200": round(e200, 3) if e200 is not None else None,
+            "RSI": round(rv, 2) if rv is not None else None,
+            "MACD": round(ml, 4) if ml is not None else None,
+            "ATR": round(av, 4) if av is not None else None,
+        }
     }
 
-
-# =========================================================
-# NEWS
-# =========================================================
 
 def get_news():
-
-    now = time.time()
-
-    with CACHE_LOCK:
-
-        if (
-            NEWS_CACHE["data"] is not None
-            and now - NEWS_CACHE["time"] < NEWS_CACHE_SECONDS
-        ):
-            return NEWS_CACHE["data"]
+    with lock:
+        if cache_fresh(news_cache, NEWS_CACHE_SECONDS):
+            return news_cache["data"]
 
     if not NEWS_API_KEY:
+        data = {"status": "unavailable", "articles": [], "message": "NEWS_API_KEY not configured"}
+        return data
 
-        return {
-            "status": "disabled",
-            "articles": []
-        }
-
-    url = "https://newsapi.org/v2/everything"
-
-    result = safe_get(
-        url,
-        params={
-            "q": "gold OR XAUUSD OR Federal Reserve OR inflation",
-            "language": "en",
-            "sortBy": "publishedAt",
-            "pageSize": 10,
-            "apiKey": NEWS_API_KEY
-        },
-        timeout=15
-    )
-
-    if not result["ok"]:
-
-        return {
-            "status": "error",
-            "articles": []
-        }
-
-    raw = result["data"]
-
-    articles = []
-
-    for item in raw.get("articles", [])[:10]:
-
-        articles.append({
-            "title": item.get("title"),
-            "description": item.get("description"),
-            "url": item.get("url"),
-            "publishedAt": item.get("publishedAt")
-        })
-
-    output = {
-        "status": "ok",
-        "articles": articles
-    }
-
-    with CACHE_LOCK:
-        NEWS_CACHE["data"] = output
-        NEWS_CACHE["time"] = time.time()
-
-    return output
-
-
-# =========================================================
-# API ROUTES
-# =========================================================
-
-@app.get("/")
-def home():
-
-    return HTMLResponse(HTML_PAGE)
-
-
-@app.get("/api/live-price")
-def live_price():
-
-    return JSONResponse(
-        get_live_price()
-    )
-
-
-@app.get("/api/candles")
-def candles(
-    timeframe: str = Query("1h")
-):
-
-    allowed = {
-        "1min",
-        "5min",
-        "15min",
-        "30min",
-        "1h",
-        "4h",
-        "1day"
-    }
-
-    if timeframe not in allowed:
-        timeframe = "1h"
-
-    return JSONResponse(
-        get_candles(
-            interval=timeframe,
-            outputsize=200
+    try:
+        r = session.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": "gold OR XAU OR precious metals",
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": 10,
+                "apiKey": NEWS_API_KEY
+            },
+            timeout=10
         )
-    )
+        payload = r.json()
 
+        if r.status_code >= 400 or payload.get("status") != "ok":
+            data = {
+                "status": "error",
+                "articles": [],
+                "message": payload.get("message", f"HTTP_{r.status_code}")
+            }
+        else:
+            data = {
+                "status": "ok",
+                "articles": [
+                    {
+                        "title": a.get("title"),
+                        "url": a.get("url"),
+                        "source": (a.get("source") or {}).get("name"),
+                        "publishedAt": a.get("publishedAt")
+                    }
+                    for a in payload.get("articles", [])
+                ]
+            }
 
-@app.get("/api/live-signal")
-def live_signal(
-    timeframe: str = Query("1h")
-):
-
-    allowed = {
-        "1min",
-        "5min",
-        "15min",
-        "30min",
-        "1h",
-        "4h",
-        "1day"
-    }
-
-    if timeframe not in allowed:
-        timeframe = "1h"
-
-    data = get_candles(
-        interval=timeframe,
-        outputsize=250
-    )
-
-    candles_data = data.get("values", [])
-
-    signal = generate_signal(
-        candles_data
-    )
-
-    signal["timeframe"] = timeframe
-
-    return JSONResponse(signal)
-
-
-@app.get("/api/news")
-def news():
-
-    return JSONResponse(
-        get_news()
-    )
+        with lock:
+            news_cache["time"] = time.time()
+            news_cache["data"] = data
+        return data
+    except Exception as e:
+        return {"status": "error", "articles": [], "message": type(e).__name__}
 
 
 @app.get("/health")
 def health():
-
     return {
         "status": "ok",
-        "service": "Gold AI Live v5",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "service": "Gold AI Live v6",
+        "time": now_iso()
     }
 
 
-# =========================================================
-# FRONTEND
-# =========================================================
+@app.get("/api/live-price")
+def live_price():
+    return get_price()
+
+
+@app.get("/api/candles")
+def candles(timeframe: str = Query("1h")):
+    return get_candles(timeframe)
+
+
+@app.get("/api/live-signal")
+def live_signal(timeframe: str = Query("1h")):
+    data = get_candles(timeframe)
+    signal = build_signal(data)
+    signal["timeframe"] = timeframe
+    signal["price"] = get_price()
+    signal["updated"] = now_iso()
+    return signal
+
+
+@app.get("/api/news")
+def news():
+    return get_news()
+
 
 HTML_PAGE = r"""
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-
-<meta name="viewport"
-content="width=device-width, initial-scale=1">
-
-<title>Gold AI Live v5</title>
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gold AI Live v6</title>
 <style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    background: #07111f;
-    color: white;
-    font-family: Arial, sans-serif;
-}
-
-.header {
-    padding: 22px;
-    background: #0b1729;
-    border-bottom: 1px solid #23334a;
-}
-
-.title {
-    font-size: 27px;
-    font-weight: bold;
-}
-
-.subtitle {
-    margin-top: 6px;
-    color: #8fa4bf;
-}
-
-.container {
-    padding: 15px;
-    max-width: 1200px;
-    margin: auto;
-}
-
-.timeframes {
-    display: grid;
-    grid-template-columns:
-    repeat(7, 1fr);
-    gap: 8px;
-    margin-bottom: 15px;
-}
-
-button {
-    border: 0;
-    border-radius: 10px;
-    padding: 13px 5px;
-    background: #172942;
-    color: white;
-    font-weight: bold;
-}
-
-button.active {
-    background: #1769ff;
-}
-
-.card {
-    background: #0d1b2e;
-    border: 1px solid #243852;
-    border-radius: 15px;
-    padding: 18px;
-    margin-bottom: 15px;
-}
-
-.price {
-    font-size: 38px;
-    font-weight: bold;
-}
-
-.status {
-    color: #61e6a1;
-    margin-left: 8px;
-}
-
-.signal {
-    font-size: 34px;
-    font-weight: bold;
-    margin-bottom: 12px;
-}
-
-.grid {
-    display: grid;
-    grid-template-columns:
-    repeat(2, 1fr);
-    gap: 15px;
-}
-
-.row {
-    display: flex;
-    justify-content: space-between;
-    padding: 9px 0;
-    border-bottom: 1px solid #20324b;
-}
-
-.label {
-    color: #8fa4bf;
-}
-
-.buy {
-    color: #45e59a;
-}
-
-.sell {
-    color: #ff647c;
-}
-
-.wait {
-    color: #ffc857;
-}
-
-.news {
-    margin-top: 10px;
-}
-
-.news-item {
-    padding: 12px 0;
-    border-bottom: 1px solid #20324b;
-}
-
-.small {
-    color: #8095ae;
-    font-size: 12px;
-}
-
-@media(max-width:700px) {
-
-    .timeframes {
-        grid-template-columns:
-        repeat(4, 1fr);
-    }
-
-    .grid {
-        grid-template-columns: 1fr;
-    }
-
-}
-
+body{margin:0;background:#0b1020;color:#f3f5f7;font-family:Arial,sans-serif}
+.wrap{max-width:1200px;margin:auto;padding:20px}
+h1{margin:0 0 6px;font-size:28px}
+.sub{color:#aab3c2;margin-bottom:20px}
+.tabs{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-bottom:18px}
+button{background:#1b2540;color:white;border:0;border-radius:10px;padding:13px 6px;font-weight:700}
+button.active{background:#2477ff}
+.card{background:#111a30;border:1px solid #273454;border-radius:16px;padding:18px;margin-bottom:14px}
+.price{font-size:34px;font-weight:800;margin-top:8px}
+.source{font-size:12px;color:#8fa1bd;margin-top:7px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.call{font-size:34px;font-weight:900;margin:10px 0}
+.wait{color:#ffd36b}.buy{color:#45e38c}.sell{color:#ff6b78}
+.row{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #26324e}
+.small{color:#aab3c2;font-size:13px}
+.news a{color:#8db8ff;text-decoration:none}
+@media(max-width:700px){.tabs{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:1fr}.price{font-size:30px}}
 </style>
-
 </head>
-
 <body>
+<div class="wrap">
+<h1>🥇 Gold AI Live v6</h1>
+<div class="sub">XAU/USD • Live Price • AI Technical Signal • Global News</div>
 
-<div class="header">
-
-    <div class="title">
-        🥇 Gold AI Live v5
-    </div>
-
-    <div class="subtitle">
-        XAU/USD • Live Price • AI Technical Signal • Global News
-    </div>
-
+<div class="tabs">
+<button data-t="1m">1m</button><button data-t="5m">5m</button>
+<button data-t="15m">15m</button><button data-t="30m">30m</button>
+<button data-t="1h">1H</button><button data-t="4h">4H</button>
+<button data-t="1d">1D</button>
 </div>
 
-<div class="container">
-
-    <div class="timeframes">
-
-        <button onclick="changeTF('1min',this)">
-            1m
-        </button>
-
-        <button onclick="changeTF('5min',this)">
-            5m
-        </button>
-
-        <button onclick="changeTF('15min',this)">
-            15m
-        </button>
-
-        <button onclick="changeTF('30min',this)">
-            30m
-        </button>
-
-        <button class="active"
-        onclick="changeTF('1h',this)">
-            1H
-        </button>
-
-        <button onclick="changeTF('4h',this)">
-            4H
-        </button>
-
-        <button onclick="changeTF('1day',this)">
-            1D
-        </button>
-
-    </div>
-
-
-    <div class="card">
-
-        <div>
-            XAU/USD
-            <span class="status"
-            id="priceStatus">
-                LIVE
-            </span>
-        </div>
-
-        <div class="price"
-        id="price">
-            Loading...
-        </div>
-
-    </div>
-
-
-    <div class="grid">
-
-        <div class="card">
-
-            <div class="small">
-                AI CALL
-            </div>
-
-            <div class="signal"
-            id="signal">
-                LOADING
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    BUY probability
-                </span>
-
-                <span id="buy">
-                    -
-                </span>
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    SELL probability
-                </span>
-
-                <span id="sell">
-                    -
-                </span>
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    Confidence
-                </span>
-
-                <span id="confidence">
-                    -
-                </span>
-            </div>
-
-        </div>
-
-
-        <div class="card">
-
-            <div class="small">
-                TECHNICAL DATA
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    EMA20
-                </span>
-
-                <span id="ema20">
-                    -
-                </span>
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    EMA50
-                </span>
-
-                <span id="ema50">
-                    -
-                </span>
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    EMA200
-                </span>
-
-                <span id="ema200">
-                    -
-                </span>
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    RSI
-                </span>
-
-                <span id="rsi">
-                    -
-                </span>
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    MACD
-                </span>
-
-                <span id="macd">
-                    -
-                </span>
-            </div>
-
-            <div class="row">
-                <span class="label">
-                    ATR
-                </span>
-
-                <span id="atr">
-                    -
-                </span>
-            </div>
-
-        </div>
-
-    </div>
-
-
-    <div class="card">
-
-        <div class="small">
-            GLOBAL GOLD NEWS
-        </div>
-
-        <div class="news"
-        id="news">
-            Loading news...
-        </div>
-
-    </div>
-
+<div class="card">
+<div>XAU/USD <span id="status">LIVE</span></div>
+<div class="price" id="price">Loading...</div>
+<div class="source" id="source">Connecting to market data...</div>
 </div>
 
+<div class="grid">
+<div class="card">
+<div class="small">AI CALL</div>
+<div id="call" class="call wait">WAIT</div>
+<div class="row"><span>BUY probability</span><b id="buy">0.0%</b></div>
+<div class="row"><span>SELL probability</span><b id="sell">0.0%</b></div>
+<div class="row"><span>Confidence</span><b id="confidence">0.0%</b></div>
+<div class="small" id="reason" style="margin-top:12px">Waiting for market data...</div>
+</div>
+
+<div class="card">
+<div class="small">TECHNICAL DATA</div>
+<div class="row"><span>EMA20</span><b id="ema20">-</b></div>
+<div class="row"><span>EMA50</span><b id="ema50">-</b></div>
+<div class="row"><span>EMA200</span><b id="ema200">-</b></div>
+<div class="row"><span>RSI</span><b id="rsi">-</b></div>
+<div class="row"><span>MACD</span><b id="macd">-</b></div>
+<div class="row"><span>ATR</span><b id="atr">-</b></div>
+</div>
+</div>
+
+<div class="card news">
+<div class="small">GLOBAL GOLD NEWS</div>
+<div id="news">Loading news...</div>
+</div>
+</div>
 
 <script>
+let timeframe="1h";
 
-let timeframe = "1h";
+function setActive(){
+ document.querySelectorAll("button[data-t]").forEach(b=>{
+   b.classList.toggle("active",b.dataset.t===timeframe);
+ });
+}
+document.querySelectorAll("button[data-t]").forEach(b=>{
+ b.onclick=()=>{timeframe=b.dataset.t;setActive();loadAll()};
+});
+setActive();
 
+function put(id,v){document.getElementById(id).textContent=(v===null||v===undefined)?"-":v}
 
-function number(value, digits=2) {
-
-    if (value === null ||
-        value === undefined) {
-
-        return "-";
-    }
-
-    return Number(value)
-        .toFixed(digits);
+async function loadPrice(){
+ try{
+   const r=await fetch("/api/live-price?x="+Date.now());
+   const d=await r.json();
+   if(d.price!==null && d.price!==undefined){
+     document.getElementById("price").textContent=Number(d.price).toFixed(2);
+     document.getElementById("source").textContent="Source: "+(d.source||"market data");
+     document.getElementById("status").textContent=d.status==="backup"?"BACKUP":"LIVE";
+   }else{
+     document.getElementById("price").textContent="Waiting for data";
+     document.getElementById("source").textContent="Market provider rate-limited/unavailable";
+   }
+ }catch(e){document.getElementById("price").textContent="Connection error"}
 }
 
-
-function changeTF(tf, button) {
-
-    timeframe = tf;
-
-    document
-        .querySelectorAll(".timeframes button")
-        .forEach(
-            b => b.classList.remove("active")
-        );
-
-    button.classList.add("active");
-
-    loadAll();
+async function loadSignal(){
+ try{
+   const r=await fetch("/api/live-signal?timeframe="+encodeURIComponent(timeframe)+"&x="+Date.now());
+   const d=await r.json();
+   const c=document.getElementById("call");
+   c.textContent=d.call||"WAIT";
+   c.className="call "+((d.call==="BUY")?"buy":(d.call==="SELL")?"sell":"wait");
+   put("buy",d.buy_probability!=null?d.buy_probability+"%":"0.0%");
+   put("sell",d.sell_probability!=null?d.sell_probability+"%":"0.0%");
+   put("confidence",d.confidence!=null?d.confidence+"%":"0.0%");
+   put("reason",d.reason||"Waiting for enough candle data");
+   const t=d.technical||{};
+   put("ema20",t.EMA20);put("ema50",t.EMA50);put("ema200",t.EMA200);
+   put("rsi",t.RSI);put("macd",t.MACD);put("atr",t.ATR);
+ }catch(e){
+   document.getElementById("reason").textContent="Signal temporarily unavailable";
+ }
 }
 
-
-async function loadPrice() {
-
-    try {
-
-        const response =
-            await fetch(
-                "/api/live-price"
-            );
-
-        const data =
-            await response.json();
-
-        if (data.price !== null &&
-            data.price !== undefined) {
-
-            document
-                .getElementById("price")
-                .innerText =
-                number(data.price, 2);
-
-            document
-                .getElementById("priceStatus")
-                .innerText = "LIVE";
-
-        }
-
-    } catch(e) {
-
-        document
-            .getElementById("priceStatus")
-            .innerText = "ERROR";
-    }
-
+async function loadNews(){
+ try{
+   const r=await fetch("/api/news?x="+Date.now());
+   const d=await r.json();
+   const el=document.getElementById("news");
+   if(!d.articles || !d.articles.length){el.textContent=d.message||"News unavailable";return}
+   el.innerHTML=d.articles.map(a=>`<div style="padding:8px 0"><a target="_blank" href="${a.url||"#"}">${a.title||"Gold news"}</a><div class="small">${a.source||""}</div></div>`).join("");
+ }catch(e){document.getElementById("news").textContent="News unavailable"}
 }
 
-
-async function loadSignal() {
-
-    try {
-
-        const response =
-            await fetch(
-                "/api/live-signal?timeframe="
-                + timeframe
-            );
-
-        const data =
-            await response.json();
-
-
-        const signal =
-            document.getElementById("signal");
-
-        signal.innerText =
-            data.signal || "WAIT";
-
-
-        signal.className =
-            "signal " +
-            (
-                data.signal === "BUY"
-                ? "buy"
-                : data.signal === "SELL"
-                ? "sell"
-                : "wait"
-            );
-
-
-        document
-            .getElementById("buy")
-            .innerText =
-            number(data.buy_probability, 1)
-            + "%";
-
-
-        document
-            .getElementById("sell")
-            .innerText =
-            number(data.sell_probability, 1)
-            + "%";
-
-
-        document
-            .getElementById("confidence")
-            .innerText =
-            number(data.confidence, 1)
-            + "%";
-
-
-        document
-            .getElementById("ema20")
-            .innerText =
-            number(data.ema20);
-
-
-        document
-            .getElementById("ema50")
-            .innerText =
-            number(data.ema50);
-
-
-        document
-            .getElementById("ema200")
-            .innerText =
-            number(data.ema200);
-
-
-        document
-            .getElementById("rsi")
-            .innerText =
-            number(data.rsi, 1);
-
-
-        document
-            .getElementById("macd")
-            .innerText =
-            number(data.macd, 4);
-
-
-        document
-            .getElementById("atr")
-            .innerText =
-            number(data.atr, 3);
-
-
-    } catch(e) {
-
-        document
-            .getElementById("signal")
-            .innerText =
-            "ERROR";
-
-    }
-
-}
-
-
-async function loadNews() {
-
-    try {
-
-        const response =
-            await fetch("/api/news");
-
-        const data =
-            await response.json();
-
-        const box =
-            document.getElementById("news");
-
-        if (!data.articles ||
-            data.articles.length === 0) {
-
-            box.innerHTML =
-                "<div class='small'>"
-                + "News unavailable"
-                + "</div>";
-
-            return;
-        }
-
-
-        box.innerHTML =
-            data.articles.map(
-                article => {
-
-                    const title =
-                        article.title ||
-                        "Gold market news";
-
-                    return `
-                        <div class="news-item">
-                            <div>
-                                ${title}
-                            </div>
-                            <div class="small">
-                                ${article.publishedAt || ""}
-                            </div>
-                        </div>
-                    `;
-
-                }
-            ).join("");
-
-    } catch(e) {
-
-        document
-            .getElementById("news")
-            .innerText =
-            "News unavailable";
-
-    }
-
-}
-
-
-function loadAll() {
-
-    loadPrice();
-    loadSignal();
-    loadNews();
-
-}
-
-
-loadAll();
-
-
-// IMPORTANT:
-// Do NOT request Twelve Data every second.
-// Backend cache handles the API.
-// Browser refreshes display only every 15 seconds.
-
-setInterval(
-    loadPrice,
-    15000
-);
-
-setInterval(
-    loadSignal,
-    60000
-);
-
-setInterval(
-    loadNews,
-    300000
-);
-
+function loadAll(){loadPrice();loadSignal()}
+loadAll();loadNews();
+setInterval(loadPrice,15000);
+setInterval(loadSignal,60000);
+setInterval(loadNews,300000);
 </script>
-
 </body>
 </html>
 """
 
 
-# =========================================================
-# STARTUP
-# =========================================================
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return HTML_PAGE
+
 
 @app.on_event("startup")
 def startup_event():
-
     print("====================================")
-    print(" GOLD AI LIVE v5 STARTED")
-    print(" Twelve Data cache: 15 sec")
+    print(" GOLD AI LIVE v6 STARTED")
+    print(" Twelve Data primary")
+    print(" Yahoo GC=F backup")
+    print(" Price cache: 15 sec")
     print(" Candle cache: 60 sec")
     print(" News cache: 5 min")
     print("====================================")
