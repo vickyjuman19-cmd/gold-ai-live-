@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import csv
 import xml.etree.ElementTree as ET
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Gold AI Live v9")
+app = FastAPI(title="Gold AI Live v10")
 
 PRICE_API_KEY = os.getenv("PRICE_API_KEY", "").strip()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
@@ -515,6 +516,151 @@ def build_signal(candle_data):
     technical_out = {k:(round(v,4) if isinstance(v,(int,float)) else v) for k,v in technical.items() if k != "score"}
     return {"call":call,"buy_probability":round(buy,1),"sell_probability":round(sell,1),"confidence":confidence,"timeframe":candle_data.get("timeframe"),"price":price,"technical":technical_out,"mtf":{k:{"score":round(v.get("score",0),2)} for k,v in mtf.items()},"news":{"bias":news.get("news_bias"),"score":news.get("news_score"),"article_count":len(news.get("articles",[]))},"risk":risk,"setup":setup,"reason":"Technical + multi-timeframe + global gold-news bias","data_source":candle_data.get("source"),"updated":now_iso()}
 
+
+# ---------------------------
+# Fast multi-timeframe signal engine (v10)
+# ---------------------------
+TF_ORDER = ["1m", "5m", "15m", "30m", "1h", "1d"]
+TF_WEIGHTS = {"1m":0.05, "5m":0.10, "15m":0.15, "30m":0.20, "1h":0.25, "1d":0.25}
+
+def news_direction(news):
+    """Return -1..+1 from the live gold-news feed."""
+    articles = news.get("articles") or []
+    if not articles:
+        return 0.0
+    weighted = 0.0
+    total = 0.0
+    for a in articles[:20]:
+        direction = float(a.get("direction") or 0)
+        impact = max(1.0, float(a.get("impact") or 1))
+        weighted += direction * impact
+        total += abs(impact)
+    if total <= 0:
+        return 0.0
+    return max(-1.0, min(1.0, weighted / (total * 1.5)))
+
+def timeframe_signal(timeframe, candles, current_price, news):
+    """Score one timeframe from technicals + live news. No order is executed."""
+    t = technical_snapshot(candles)
+    closes = [x["close"] for x in candles]
+    if current_price is None or len(closes) < 50:
+        return {"timeframe": timeframe, "signal":"WAIT", "strength":0,
+                "buy_probability":50.0, "sell_probability":50.0,
+                "reason":"Waiting for enough live candle data"}
+
+    score = 0.0
+    reasons = []
+    e20, e50, e200 = t.get("EMA20"), t.get("EMA50"), t.get("EMA200")
+    rv, ml, ms = t.get("RSI"), t.get("MACD"), t.get("MACDSignal")
+
+    if e20 is not None and e50 is not None:
+        if e20 > e50: score += 20; reasons.append("EMA bullish")
+        else: score -= 20; reasons.append("EMA bearish")
+    if e200 is not None:
+        if current_price > e200: score += 15; reasons.append("above EMA200")
+        else: score -= 15; reasons.append("below EMA200")
+    if rv is not None:
+        if rv >= 60: score += 15; reasons.append("RSI bullish")
+        elif rv <= 40: score -= 15; reasons.append("RSI bearish")
+        elif rv >= 52: score += 7; reasons.append("RSI positive")
+        elif rv <= 48: score -= 7; reasons.append("RSI negative")
+    if ml is not None and ms is not None:
+        if ml > ms: score += 15; reasons.append("MACD bullish")
+        else: score -= 15; reasons.append("MACD bearish")
+
+    # Short momentum: direction of the latest 3 closes.
+    if len(closes) >= 4:
+        mom = closes[-1] - closes[-4]
+        if mom > 0: score += 10; reasons.append("momentum up")
+        elif mom < 0: score -= 10; reasons.append("momentum down")
+
+    # 20-candle breakout/breakdown confirmation.
+    recent = candles[-21:-1] if len(candles) >= 21 else candles[:-1]
+    if recent:
+        hi = max(x["high"] for x in recent)
+        lo = min(x["low"] for x in recent)
+        if current_price > hi: score += 10; reasons.append("breakout")
+        elif current_price < lo: score -= 10; reasons.append("breakdown")
+
+    nd = news_direction(news)
+    if nd > 0.25: score += 15; reasons.append("news bullish")
+    elif nd < -0.25: score -= 15; reasons.append("news bearish")
+    else: reasons.append("news mixed")
+
+    score = max(-100.0, min(100.0, score))
+    buy = max(0.0, min(100.0, 50.0 + score * 0.5))
+    sell = 100.0 - buy
+
+    if score >= 60: signal = "STRONG BUY"
+    elif score >= 30: signal = "BUY"
+    elif score <= -60: signal = "STRONG SELL"
+    elif score <= -30: signal = "SELL"
+    else: signal = "WAIT"
+
+    return {
+        "timeframe": timeframe,
+        "signal": signal,
+        "strength": round(abs(score), 1),
+        "score": round(score, 1),
+        "buy_probability": round(buy, 1),
+        "sell_probability": round(sell, 1),
+        "price": round(float(current_price), 2),
+        "rsi": round(rv, 2) if rv is not None else None,
+        "ema20": round(e20, 2) if e20 is not None else None,
+        "ema50": round(e50, 2) if e50 is not None else None,
+        "ema200": round(e200, 2) if e200 is not None else None,
+        "macd": round(ml, 4) if ml is not None else None,
+        "macd_signal": round(ms, 4) if ms is not None else None,
+        "news_bias": news.get("news_bias", "MIXED"),
+        "news_score": news.get("news_score", 0),
+        "reason": ", ".join(reasons[:8]),
+    }
+
+def build_all_signals():
+    price_data = get_price()
+    current_price = price_data.get("price")
+    news = get_news()
+    results = {}
+
+    def one(tf):
+        d = get_candles(tf)
+        return tf, timeframe_signal(tf, d.get("candles") or [], current_price, news)
+
+    # Fetch all requested timeframes in parallel so the dashboard does not hang.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(one, tf) for tf in TF_ORDER]
+        for f in as_completed(futures):
+            tf, sig = f.result()
+            results[tf] = sig
+
+    weighted = sum(results[tf].get("score", 0) * TF_WEIGHTS[tf] for tf in TF_ORDER if tf in results)
+    higher = [results.get(tf, {}).get("score", 0) for tf in ["30m","1h","1d"] if tf in results]
+    higher_avg = sum(higher) / len(higher) if higher else 0
+
+    # Strong overall direction needs both the weighted score and higher-timeframe confirmation.
+    overall_score = (weighted * 0.6) + (higher_avg * 0.4)
+    if overall_score >= 60: overall = "STRONG BUY"
+    elif overall_score >= 30: overall = "BUY"
+    elif overall_score <= -60: overall = "STRONG SELL"
+    elif overall_score <= -30: overall = "SELL"
+    else: overall = "WAIT"
+
+    return {
+        "symbol": SYMBOL,
+        "price": price_data,
+        "overall": overall,
+        "overall_score": round(overall_score, 1),
+        "news": {
+            "bias": news.get("news_bias", "MIXED"),
+            "score": news.get("news_score", 0),
+            "article_count": len(news.get("articles", [])),
+            "updated": news.get("updated"),
+        },
+        "timeframes": {tf: results.get(tf, {"timeframe":tf,"signal":"WAIT","reason":"No data"}) for tf in TF_ORDER},
+        "updated": now_iso(),
+        "disclaimer": "Analytical signal only. No broker order is executed and no signal is guaranteed.",
+    }
+
 GOLD_PHRASES = ["gold price","gold prices","spot gold","gold futures","gold bullion","gold market","xau/usd","xauusd","precious metals","bullion","comex gold","gold etf","gold demand"]
 MACRO_PHRASES = ["federal reserve","fed meeting","fed decision","interest rate","interest rates","rate hike","rate cut","inflation","consumer price index","cpi","treasury yield","treasury yields","bond yields","us dollar","dollar index","central bank","safe haven","oil prices","crude oil","geopolitical","middle east","sanctions","tariff","trade war","bank of japan","ecb","rbi","pboc"]
 BLOCKED_PHRASES = ["goldfish","golden retriever","golden state","golden boot","golden globe","gold medal","gold coast","golden visa","golden gate","golden ratio"]
@@ -739,7 +885,7 @@ def get_news():
 def health():
     return {
         "status": "ok",
-        "service": "Gold AI Live v9.1",
+        "service": "Gold AI Live v10",
         "time": now_iso()
     }
 
@@ -762,6 +908,11 @@ def live_signal(timeframe: str = Query("1h")):
     signal["price"] = get_price()
     signal["updated"] = now_iso()
     return signal
+
+
+@app.get("/api/signals")
+def signals():
+    return build_all_signals()
 
 
 @app.get("/api/news")
@@ -809,8 +960,7 @@ def service_worker_reset():
 
 
 
-HTML_PAGE = r""" <!doctype html> <html lang="en"> <head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"> <title>Gold AI Live v9</title> <style> :root{ --bg:#07101d;--card:#0d192b;--card2:#102039;--line:#243754; --text:#f5f7fb;--muted:#91a0b8;--blue:#2678ff; --green:#20d59a;--red:#ff5d70;--gold:#f3bd3f;--yellow:#ffd66b; } *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 50% -10%,#122743 0,#07101d 42%,#050b14 100%); color:var(--text);font-family:Inter,Arial,sans-serif} .wrap{max-width:1180px;margin:auto;padding:18px 18px 34px} .top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px} .brand{display:flex;gap:12px;align-items:center}.logo{font-size:35px} h1{font-size:27px;margin:0 0 4px;letter-spacing:-.5px} .sub{color:#aab6c9;font-size:14px;line-height:1.35} .livebox{text-align:right}.live{display:inline-flex;align-items:center;gap:7px;color:#00e69a;font-weight:800} .dot{width:10px;height:10px;background:#00e69a;border-radius:50%;display:inline-block;box-shadow:0 0 12px #00e69a} .clock{color:#91a0b8;font-size:12px;margin-top:4px} .tabs{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin:16px 0} button{background:#14243d;color:#eef3fb;border:1px solid #1c3150;border-radius:13px;padding:13px 5px;font-size:15px;font-weight:800} button.active{background:var(--blue);border-color:#4d94ff;box-shadow:0 8px 25px #2678ff33} .card{background:linear-gradient(145deg,#0e1b2f,#0a1525);border:1px solid var(--line);border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 35px #00000022} .pricecard{padding:20px} .pricegrid{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:18px;align-items:center} .instrument{color:#dfe7f4;font-size:15px;font-weight:800}.instrument span{color:#6f819e;font-weight:600;margin-left:8px} .price{font-size:48px;font-weight:950;letter-spacing:-1px;margin:5px 0} .change{font-weight:800}.down{color:var(--red)}.up{color:var(--green)} .quote{border-radius:15px;padding:15px 16px;text-align:center;border:1px solid} .quote.sell{border-color:#ff5268;background:#341725}.quote.buy{border-color:#00c996;background:#092f2a} .qtitle{font-weight:800;font-size:15px}.qprice{font-size:28px;font-weight:950;margin-top:4px} .spreadrow{display:flex;justify-content:space-around;color:var(--muted);font-size:12px;margin-top:10px} .spreadrow b{display:block;color:#e8edf5;font-size:14px;margin-top:3px} .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px} .section-title{font-size:13px;color:#a9b5c8;font-weight:800;letter-spacing:.2px} .call{font-size:42px;font-weight:950;margin:10px 0}.call.buy{color:var(--green)}.call.sell{color:var(--red)}.call.wait{color:var(--yellow)} .badge{float:right;border-radius:14px;padding:6px 10px;font-size:12px;font-weight:900} .badge.bear{background:#4a1d28;color:#ff8291}.badge.bull{background:#103b31;color:#48e6b0}.badge.mix{background:#3d3217;color:#ffd66b} .row{display:flex;justify-content:space-between;gap:15px;padding:10px 0;border-bottom:1px solid #203149} .row:last-child{border-bottom:0}.row span{color:#dfe6f0}.row b{color:#f7f9fc} .source{margin-top:10px;color:#8493aa;font-size:12px} .source strong{color:#00d99b} .notice{border:1px solid #1d785f;background:#06261f;border-radius:16px;padding:13px 15px;color:#aeeedd;margin-top:12px} .notice.warn{border-color:#775f24;background:#2b220b;color:#ffe5a0} .news a{color:#a9c8ff;text-decoration:none;font-weight:700}.newsitem{padding:11px 0;border-bottom:1px solid #203149}.newsitem:last-child{border-bottom:0} .small{font-size:12px;color:var(--muted);line-height:1.4} .refresh{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px;margin:4px 2px 12px} .refresh strong{color:#00df9c} @media(max-width:760px){ .wrap{padding:12px 12px 28px}.top{align-items:flex-start}.livebox{display:none} h1{font-size:24px}.sub{font-size:13px}.tabs{grid-template-columns:repeat(4,1fr);gap:7px} .pricegrid{grid-template-columns:1fr 1fr;gap:10px}.mainprice{grid-column:1/-1} .price{font-size:40px}.qprice{font-size:23px}.grid{grid-template-columns:1fr} .card{border-radius:17px;padding:15px} } </style> </head> <body> <div class="wrap"> <div class="top"> <div class="brand"> <div class="logo">ðŸ¥‡</div> <div> <h1>Gold AI Live v9 <span class="live"><span class="dot"></span>Live</span></h1> <div class="sub">XAU/USD â€¢ XM360-focused â€¢ Technical + Multi-Timeframe + Global News</div> </div> </div> <div class="livebox"> <div class="live"><span class="dot"></span>Live Market</div> <div id="clock" class="clock">--:--:-- IST</div> </div> </div> <div class="tabs"> <button data-t="1m">1m</button><button data-t="5m">5m</button> <button data-t="15m">15m</button><button data-t="30m">30m</button> <button data-t="1h">1H</button><button data-t="4h">4H</button><button data-t="1d">1D</button> </div> <div class="card pricecard"> <div class="pricegrid"> <div class="mainprice"> <div class="instrument">XAU/USD (GOLD) <span id="mode">Market</span></div> <div id="price" class="price">Loading...</div> <div id="change" class="change">Live quote</div> </div> <div class="quote sell"><div class="qtitle">SELL</div><div id="sellq" class="qprice">-</div></div> <div class="quote buy"><div class="qtitle">BUY</div><div id="buyq" class="qprice">-</div></div> </div> <div class="spreadrow"> <div>Spread<b id="spread">-</b></div> <div>Source<b id="source">-</b></div> <div>Updated<b id="updated">-</b></div> </div> </div> <div class="refresh"> <span>Data status: <strong id="status">Connecting...</strong></span> <span>Auto refresh: <strong>ON â€¢ 10s price / 30s signal / 2m news</strong></span> </div> <div class="grid"> <div class="card"> <div class="section-title">AI MARKET CALL <span id="biasbadge" class="badge mix">WAIT</span></div> <div id="call" class="call wait">WAIT</div> <div class="row"><span>BUY possibility</span><b id="buy">-</b></div> <div class="row"><span>SELL possibility</span><b id="sell">-</b></div> <div class="row"><span>Model confidence</span><b id="conf">-</b></div> <div class="row"><span>Global news bias</span><b id="nbias">-</b></div> <div class="row"><span>News articles</span><b id="ncount">-</b></div> <div class="source" id="reason">Waiting for live analysis...</div> </div> <div class="card"> <div class="section-title">MARKET CANDLE ANALYSIS <span id="candlebadge" class="badge mix">-</span></div> <div class="row"><span>Candle source</span><b id="csource">-</b></div> <div class="row"><span>EMA20</span><b id="e20">-</b></div> <div class="row"><span>EMA50</span><b id="e50">-</b></div> <div class="row"><span>EMA200</span><b id="e200">-</b></div> <div class="row"><span>RSI</span><b id="rsi">-</b></div> <div class="row"><span>MACD</span><b id="macd">-</b></div> <div class="row"><span>ATR</span><b id="atr">-</b></div> </div> </div> <div class="grid"> <div class="card"> <div class="section-title">ðŸŸ¢ BEST BUY SETUP</div> <div class="row"><span>Buy trigger</span><b id="buytrigger">-</b></div> <div class="row"><span>Stop Loss</span><b id="buysetupsl">-</b></div> <div class="row"><span>TP1</span><b id="buysetuptp1">-</b></div> <div class="row"><span>TP2</span><b id="buysetuptp2">-</b></div> <div class="small" id="buystatus">Waiting for live confirmation...</div> </div> <div class="card"> <div class="section-title">ðŸ”´ BEST SELL SETUP</div> <div class="row"><span>Sell trigger</span><b id="selltrigger">-</b></div> <div class="row"><span>Stop Loss</span><b id="sellsetupsl">-</b></div> <div class="row"><span>TP1</span><b id="sellsetuptp1">-</b></div> <div class="row"><span>TP2</span><b id="sellsetuptp2">-</b></div> <div class="small" id="sellstatus">Waiting for live confirmation...</div> </div> </div> <div class="card"> <div class="section-title">STOP LOSS / TAKE PROFIT / PROFIT LOCK</div> <div class="row"><span>Entry</span><b id="entry">-</b></div> <div class="row"><span>Stop Loss</span><b id="sl">-</b></div> <div class="row"><span>TP1</span><b id="tp1">-</b></div> <div class="row"><span>TP2</span><b id="tp2">-</b></div> <div class="row"><span>TP3</span><b id="tp3">-</b></div> <div class="row"><span>Profit Lock</span><b id="plock">-</b></div> <div class="small" style="margin-top:10px">Analytical levels only. The dashboard does not place broker orders. BUY/SELL triggers require live confirmation; no signal is guaranteed.</div> </div> <div class="card"> <div class="section-title">GLOBAL GOLD NEWS</div> <div id="news" class="news">Loading...</div> </div> <div id="notice" class="notice warn"> <b>Price protection:</b> The displayed Gold price is taken directly from the connected price feed. No manual price adjustment or synthetic offset is applied. XM360 is treated as exact only when its feed/CSV is connected. </div> </div> <script> let tf="1h"; const $=id=>document.getElementById(id); const put=(id,v)=>$(id).textContent=(v===null||v===undefined||v==="")?"-":v; function setActive(){ document.querySelectorAll("[data-t]").forEach(b=>b.classList.toggle("active",b.dataset.t===tf)); } document.querySelectorAll("[data-t]").forEach(b=>b.onclick=()=>{tf=b.dataset.t;setActive();loadSignal()}); setActive(); function fmt(v){ if(v==null || v==="") return "-"; const n=Number(v); return Number.isFinite(n) ? n.toFixed(2) : "-"; } function updateClock(){ const d=new Date(); const s=d.toLocaleTimeString("en-IN",{hour12:false,timeZone:"Asia/Kolkata"}); $("clock").textContent=s+" IST"; } setInterval(updateClock,1000); updateClock(); async function loadPrice(){ try{ const d=await (await fetch("/api/live-price?x="+Date.now(),{cache:"no-store"})).json(); if(d.price!=null){ const p=Number(d.price); put("price",fmt(p)); // PRICE LOCK: display the exact current price returned by /api/live-price. // Do not calculate, offset, round, or replace the main Gold price. // SELL/BUY remain display-only and do not modify the market price. const bid=d.sell ?? d.bid ?? p; const ask=d.buy ?? d.ask ?? p; put("sellq",fmt(bid)); put("buyq",fmt(ask)); put("spread",fmt(Number(ask)-Number(bid))); put("source",d.source||"-"); put("updated",new Date().toLocaleTimeString("en-IN",{hour12:false})); $("status").textContent=d.status==="backup"?"BACKUP DATA":"LIVE DATA"; $("mode").textContent=d.status==="backup"?"Backup":"Live"; $("notice").className=d.status==="backup"?"notice warn":"notice"; $("notice").innerHTML=d.status==="backup" ? "<b>Backup data:</b> The current quote is not confirmed as the exact XM360 broker quote." : "<b>Live data:</b> Current market feed is connected."; }else{ $("status").textContent="WAITING FOR DATA"; } }catch(e){$("status").textContent="CONNECTION ERROR"} } async function loadSignal(){ try{ const d=await (await fetch("/api/live-signal?timeframe="+encodeURIComponent(tf)+"&x="+Date.now(),{cache:"no-store"})).json(); const c=$("call"); c.textContent=d.call||"WAIT"; c.className="call "+(d.call==="BUY"?"buy":d.call==="SELL"?"sell":"wait"); put("buy",(d.buy_probability??"-")+"%"); put("sell",(d.sell_probability??"-")+"%"); put("conf",(d.confidence??"-")+"%"); put("nbias",d.news?.bias||"-"); put("ncount",d.news?.article_count??"-"); put("reason",d.reason||"-"); put("csource",d.data_source||"-"); $("candlebadge").textContent=d.data_source||"-"; const t=d.technical||{}; put("e20",fmt(t.EMA20)); put("e50",fmt(t.EMA50)); put("e200",fmt(t.EMA200)); put("rsi",fmt(t.RSI)); put("macd",fmt(t.MACD)); put("atr",fmt(t.ATR)); const r=d.risk||{}; put("entry",fmt(r.entry)); put("sl",fmt(r.stop_loss)); put("tp1",fmt(r.tp1)); put("tp2",fmt(r.tp2)); put("tp3",fmt(r.tp3)); put("plock",fmt(r.profit_lock)); const setup=d.setup||{}; const bs=setup.buy||{}, ss=setup.sell||{}; put("buytrigger",fmt(bs.trigger)); put("buysetupsl",fmt(bs.stop_loss)); put("buysetuptp1",fmt(bs.tp1)); put("buysetuptp2",fmt(bs.tp2)); put("selltrigger",fmt(ss.trigger)); put("sellsetupsl",fmt(ss.stop_loss)); put("sellsetuptp1",fmt(ss.tp1)); put("sellsetuptp2",fmt(ss.tp2)); $("buystatus").textContent=bs.status||"Waiting for live confirmation..."; $("sellstatus").textContent=ss.status||"Waiting for live confirmation..."; const bias=(d.news?.bias||"MIXED").toUpperCase(); const bb=$("biasbadge"); bb.textContent=bias; bb.className="badge "+(bias==="BEARISH"?"bear":bias==="BULLISH"?"bull":"mix"); }catch(e){ $("call").textContent="WAIT"; $("call").className="call wait"; put("reason","Signal temporarily unavailable"); } } async function loadNews(){ try{ const d=await (await fetch("/api/news?x="+Date.now(),{cache:"no-store"})).json(); if(!d.articles?.length){ $("news").innerHTML=`<div class="small">${d.message||"Live gold news temporarily unavailable. The feed will retry automatically."}</div>`; return; } $("news").innerHTML=d.articles.map(a=>{ const dir=a.direction>0?"bullish":a.direction<0?"bearish":"neutral"; const dt=a.publishedAt ? new Date(a.publishedAt).toLocaleString("en-IN",{hour12:false}) : ""; return `<div class="newsitem"><a target="_blank" rel="noopener" href="${a.url||"#"}">${a.title||"Gold news"}</a> <div class="small">${a.source||""} â€¢ impact ${a.impact||"-"} â€¢ ${dir}${dt ? " â€¢ "+dt : ""}</div></div>`; }).join(""); }catch(e){$("news").textContent="News unavailable"} } function loadAll(){loadPrice();loadSignal();loadNews()} loadAll(); setInterval(loadPrice,10000); setInterval(loadSignal,30000); setInterval(loadNews,120000); </script> </body> </html> """
-
+HTML_PAGE = r""" <!doctype html> <html lang="en"> <head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"> <title>Gold AI Live v10</title> <style> *{box-sizing:border-box}body{margin:0;background:#08111f;color:#f5f7fb;font-family:Arial,sans-serif}.wrap{max-width:900px;margin:auto;padding:16px}.head{display:flex;justify-content:space-between;align-items:center;gap:10px}.head h1{margin:0;font-size:25px}.live{color:#20d59a;font-weight:800}.sub{color:#94a3b8;margin-top:5px;font-size:13px}.pricebox,.overall,.card{background:#0e1b2d;border:1px solid #263a57;border-radius:18px;padding:18px;margin-top:14px}.price{font-size:42px;font-weight:900;margin:8px 0}.source{color:#8fa0b8;font-size:12px}.overall{display:flex;justify-content:space-between;align-items:center}.overall b{font-size:27px}.green{color:#20d59a}.red{color:#ff6375}.yellow{color:#ffd66b}.muted{color:#94a3b8}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:14px}.card{margin:0}.tf{font-size:16px;font-weight:800;color:#aebbd0}.sig{font-size:24px;font-weight:900;margin:7px 0}.bar{height:7px;background:#1d2a3d;border-radius:9px;overflow:hidden;margin:9px 0}.bar i{display:block;height:100%;background:#20d59a}.row{display:flex;justify-content:space-between;color:#aebbd0;font-size:13px;margin-top:5px}.news{line-height:1.35}.article{border-top:1px solid #22334d;padding:10px 0}.article a{color:#dbe6f7;text-decoration:none;font-weight:700}.refresh{margin-top:12px;color:#8292a9;font-size:12px}@media(max-width:600px){.grid{grid-template-columns:1fr}.price{font-size:38px}.overall b{font-size:23px}} </style> </head> <body><div class="wrap"> <div class="head"><div><h1>Gold AI Live <span class="live">LIVE</span></h1><div class="sub">XAU/USD • Live price + multi-timeframe technicals + gold news</div></div></div> <div class="pricebox"><div class="muted">XAU/USD</div><div id="price" class="price">Loading...</div><div id="source" class="source">Connecting to live price...</div></div> <div class="overall"><div><div class="muted">OVERALL MARKET SIGNAL</div><b id="overall">WAIT</b></div><div style="text-align:right"><div class="muted">News</div><b id="newsBias">-</b></div></div> <div class="grid" id="signals"></div> <div class="pricebox news"><div style="font-size:20px;font-weight:800">Gold News</div><div id="newsList" class="muted" style="margin-top:8px">Loading news...</div></div> <div id="status" class="refresh">Auto refresh: price 10s • signals 30s • news 2m</div> </div> <script> const $=id=>document.getElementById(id); function cls(s){return s.includes('BUY')?'green':s.includes('SELL')?'red':'yellow'} function esc(x){return String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))} async function loadPrice(){try{const d=await fetch('/api/live-price?x='+Date.now(),{cache:'no-store'}).then(r=>r.json()); if(d.price!=null){$('price').textContent=Number(d.price).toFixed(2);$('source').textContent=(d.source||'Live')+' • '+(d.updated||'')}else{$('price').textContent='Unavailable';$('source').textContent='Live price unavailable; retrying...'}}catch(e){$('source').textContent='Price connection retrying...'}} async function loadSignals(){try{const d=await fetch('/api/signals?x='+Date.now(),{cache:'no-store'}).then(r=>r.json());$('overall').textContent=d.overall||'WAIT';$('overall').className=cls(d.overall||'WAIT');$('newsBias').textContent=d.news?.bias||'MIXED';$('newsBias').className=cls(d.news?.bias||'');let html='';for(const tf of ['1m','5m','15m','30m','1h','1d']){const x=d.timeframes?.[tf]||{};const buy=Number(x.buy_probability||50);html+=`<div class="card"><div class="tf">${tf}</div><div class="sig ${cls(x.signal||'WAIT')}">${esc(x.signal||'WAIT')}</div><div class="bar"><i style="width:${Math.max(0,Math.min(100,buy))}%"></i></div><div class="row"><span>BUY ${buy.toFixed(1)}%</span><span>SELL ${Number(x.sell_probability||50).toFixed(1)}%</span></div><div class="row"><span>RSI ${x.rsi??'-'}</span><span>Score ${x.score??0}</span></div><div class="row"><span colspan="2">${esc(x.reason||'Waiting for data')}</span></div></div>`}$('signals').innerHTML=html;$('status').textContent='Live • updated '+(d.updated||'')+' • auto refresh 10s/30s/2m'}catch(e){$('status').textContent='Signal data retrying automatically...'}} async function loadNews(){try{const d=await fetch('/api/news?x='+Date.now(),{cache:'no-store'}).then(r=>r.json());const a=d.articles||[];if(!a.length){$('newsList').textContent=d.message||'News temporarily unavailable';return}$('newsList').innerHTML=a.slice(0,8).map(x=>`<div class="article"><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title)}</a><div class="muted">${esc(x.source||'News')} • ${esc(x.publishedAt||'')}</div></div>`).join('')}catch(e){$('newsList').textContent='News retrying automatically...'}} loadPrice();loadSignals();loadNews();setInterval(loadPrice,10000);setInterval(loadSignals,30000);setInterval(loadNews,120000); </script></body></html> """
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -827,7 +977,7 @@ def dashboard():
 @app.on_event("startup")
 def startup_event():
     print("====================================")
-    print(" GOLD AI LIVE v9 STARTED")
+    print(" GOLD AI LIVE v10 STARTED")
     print(" Twelve Data primary")
     print(" Yahoo GC=F backup")
     print(" Price cache: 10 sec")
